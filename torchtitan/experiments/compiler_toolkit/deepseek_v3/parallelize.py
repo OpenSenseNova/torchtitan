@@ -5,8 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 
-from contextlib import contextmanager
-
 import torch
 import torch.nn as nn
 
@@ -16,75 +14,22 @@ from torch._guards import tracing
 from torch.distributed.tensor import DTensor, Replicate
 
 from torch.fx.traceback import annotate_fn
+from torch.utils._pytree import tree_map
 from torchtitan.config import JobConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.expert_parallel import ExpertParallel
+from torchtitan.experiments.compiler_toolkit.common_utils import disable_compile
 
-from torchtitan.experiments.compiler_toolkit.graph_utils import export_joint
+from torchtitan.experiments.compiler_toolkit.graph_utils import (
+    CompiledModule,
+    export_joint,
+)
+
 from torchtitan.experiments.simple_fsdp.deepseek_v3.parallelize import (
     parallelize_deepseekv3 as simple_fsdp_parallelize_deepseekv3,
 )
 from torchtitan.models.moe.moe import MoE
 from torchtitan.tools.logging import logger
-
-
-@contextmanager
-def disable_compile(job_config: JobConfig):
-    """Context manager to temporarily disable compilation."""
-    original_value = job_config.compile.enable
-    job_config.compile.enable = False
-    try:
-        yield
-    finally:
-        job_config.compile.enable = original_value
-
-
-class CompiledModule(torch.nn.Module):
-    def __init__(self, inner: torch.nn.Module, parallel_dims, **overrides):
-        super().__init__()
-        self.inner = inner  # register as submodule
-        self.parallel_dims = parallel_dims
-
-        self.joint_graph_module = None
-        self._overrides = overrides  # for custom hooks
-
-    def __getattr__(self, name):
-        # check overrides
-        if "_overrides" in self.__dict__ and name in self._overrides:
-            return self._overrides[name]
-        try:
-            # let nn.Module handle registered stuff
-            return super().__getattr__(name)
-        except AttributeError:
-            # fallback to inner model
-            return getattr(self.inner, name)
-
-    def __setattr__(self, name, value):
-        if "_overrides" in self.__dict__ and name in self._overrides:
-            self._overrides[name] = value
-        else:
-            super().__setattr__(name, value)
-
-    def __delattr__(self, name):
-        if "_overrides" in self.__dict__ and name in self._overrides:
-            del self._overrides[name]
-        else:
-            super().__delattr__(name)
-
-    def forward(self, *args, **kwargs):
-        assert "forward" not in self._overrides, "forward cannot be overridden"
-        dt_args = tuple(
-            DTensor.from_local(arg, self.parallel_dims.world_mesh["tp"], [Replicate()])
-            for arg in args
-        )
-        if self.joint_graph_module is None:
-            self.joint_graph_module = joint_graph_builder(
-                self.inner, *dt_args, **kwargs
-            )
-
-        # calling the line below returns control to torchtitan's runner
-        # letting it call the backward, and optimizer.
-        return self.joint_graph_module(args, kwargs)
 
 
 def joint_graph_builder(model, *args, **kwargs):
@@ -130,6 +75,18 @@ def joint_graph_builder(model, *args, **kwargs):
     return wrapper_fn
 
 
+def parallelize_inputs(world_mesh, args, kwargs):
+    def to_dtensor(tensor):
+        if isinstance(tensor, torch.Tensor):
+            return DTensor.from_local(tensor, world_mesh["tp"], [Replicate()])
+        return tensor
+
+    dt_args = tree_map(to_dtensor, args)
+    dt_kwargs = tree_map(to_dtensor, kwargs)
+
+    return dt_args, dt_kwargs
+
+
 def annotate_model() -> None:
     # annotate the MoE with dispatch, compute and combine
     ExpertParallel._token_dispatch = annotate_fn({"EP": "dispatch"})(
@@ -155,6 +112,8 @@ def parallelize_deepseekv3(
 
     # TODO: CompiledModule should take sample input as well, so that we can
     # compile ahead of time.
-    model = CompiledModule(model, parallel_dims)
+    model = CompiledModule(
+        model, parallel_dims, joint_graph_builder, parallelize_inputs
+    )
 
     return model
