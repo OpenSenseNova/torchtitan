@@ -113,6 +113,12 @@ def get_peak_flops(device_name: str) -> float:
         # Ref: https://www.tomshardware.com/news/
         # nvidias-latest-regulation-compliant-gpu-for-china-has-been-delayed-to-early-next-year
         return 148e12
+    elif "SM100_NVLINK" in device_name or "SM103_NVLINK" in device_name:
+        # Grace sm100_family Superchips (Grace CPU + sm100_family GPU)
+        # BF16 dense per GPU: 2,500 TFLOPS (half of 5,000 TFLOPS with sparsity)
+        # SM100_NVLINK data from 
+        # SM103_NVLINK data from 
+        return 2.5e15
     elif "SM100" in device_name:
         # data from 
         return 2.25e15
