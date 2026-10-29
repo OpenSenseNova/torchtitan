@@ -1,0 +1,2 @@
+transformers>=5.10.1
+sentencepiece

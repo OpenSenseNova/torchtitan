@@ -1,0 +1,125 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""
+Parallelization utilities for Qwen3.5.
+
+This module applies PT-D parallelisms and various training techniques
+(activation checkpointing, compile, FSDP) to the Qwen3.5 model.
+"""
+
+import torch.nn as nn
+
+from torchtitan.config import (
+    CompileConfig,
+    ParallelismConfig,
+    TORCH_DTYPE_MAP,
+    TrainingConfig,
+)
+
+from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.compile import apply_compile
+from torchtitan.distributed.fsdp import (
+    apply_fsdp_to_decoder,
+    apply_fsdp_to_vision_encoder,
+    resolve_fsdp_mesh,
+    resolve_sparse_fsdp_mesh,
+)
+
+
+def parallelize_qwen3_5(
+    model: nn.Module,
+    *,
+    parallel_dims: ParallelDims,
+    training: TrainingConfig,
+    parallelism: ParallelismConfig,
+    compile_config: CompileConfig | None,
+    ac_config: ActivationCheckpointingConfig,
+    dump_folder: str,
+    skip_dp: bool = False,
+    extra_layer_names: tuple[str, ...] = (),
+):
+    """
+    Apply tensor parallelism, activation checkpointing, torch.compile, and data
+    parallelism to the Qwen3.5 model.
+
+    ``skip_dp=True`` applies TP/AC/compile but no FSDP/DP -- used by the vLLM
+    generator, which replicates params across vLLM DP groups (not TorchTitan FSDP).
+
+    NOTE: The passed-in model preferably should be on meta device. Otherwise,
+    the model must fit on GPU or CPU memory.
+    """
+    model_compile_enabled = (
+        compile_config is not None and "model" in compile_config.components
+    )
+
+    # Only adapters that supply CP-safe GDN, vision scatter and attention
+    # metadata can opt in. Native Qwen3.5 retains the unsupported-path guard.
+    if parallel_dims.cp_enabled and not getattr(model, "_qwen35_cp_supported", False):
+        raise NotImplementedError(
+            "Context Parallel is not yet supported for Qwen3.5. "
+            "Use an adapter with CP-safe GatedDeltaNet and vision scatter "
+            "before CP sharding."
+        )
+
+    model.parallelize(parallel_dims)  # pyrefly: ignore [not-callable]
+
+    if ac_config is not None:
+        ac_policy = ac_config.build(dump_folder=dump_folder)
+        ac_policy.apply(model, extra_layer_names=extra_layer_names)
+        if model.vision_encoder is not None:
+            ac_policy.apply(model.vision_encoder)
+
+    if model_compile_enabled:
+        apply_compile(
+            model,
+            compile_config=compile_config,
+            parallel_dims=parallel_dims,
+        )
+        if model.vision_encoder is not None:
+            apply_compile(
+                model.vision_encoder,  # pyrefly: ignore [bad-argument-type]
+                compile_config=compile_config,
+                parallel_dims=parallel_dims,
+            )
+
+    # Generator inference: TP/AC/compile only, no FSDP/DP (vLLM owns DP).
+    if skip_dp:
+        return model
+
+    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+    edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
+
+    if model.vision_encoder is not None:
+        apply_fsdp_to_vision_encoder(
+            model.vision_encoder,  # pyrefly: ignore [bad-argument-type]
+            dp_mesh,
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+            pp_enabled=parallel_dims.pp_enabled,
+            cpu_offload=training.enable_cpu_offload,
+            dp_mesh_dims=dp_mesh_dims,
+        )
+
+    apply_fsdp_to_decoder(
+        model,  # pyrefly: ignore [bad-argument-type]
+        dp_mesh,
+        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+        pp_enabled=parallel_dims.pp_enabled,
+        cpu_offload=training.enable_cpu_offload,
+        reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+        ep_degree=parallel_dims.ep,
+        edp_mesh=edp_mesh,
+        dp_mesh_dims=dp_mesh_dims,
+        edp_mesh_dims=edp_mesh_dims,
+        symm_mem_scope=parallelism.fsdp_symm_mem_scope,
+        extra_layer_names=extra_layer_names,
+    )
+
+    return model

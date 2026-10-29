@@ -1,0 +1,5 @@
+{"messages":[{"role":"user","content":"What is 2 + 2?"},{"role":"assistant","content":"2 + 2 = 4."}],"rejected_response":"2 + 2 = 5."}
+{"messages":[{"role":"user","content":"Name one primary color."},{"role":"assistant","content":"Red."}],"rejected_response":"A triangle."}
+{"messages":[{"role":"user","content":"Translate hello into French."},{"role":"assistant","content":"Bonjour."}],"rejected_response":"Goodbye."}
+{"messages":[{"role":"user","content":"Give a short greeting."},{"role":"assistant","content":"Hello!"},{"role":"user","content":"Now say goodbye politely."},{"role":"assistant","content":"Goodbye, and have a lovely day!"}],"rejected_response":"I refuse to say goodbye."}
+{"messages":[{"role":"user","content":"Which is larger, 9 or 3?"},{"role":"assistant","content":"9 is larger than 3."}],"rejected_response":"3 is larger than 9."}

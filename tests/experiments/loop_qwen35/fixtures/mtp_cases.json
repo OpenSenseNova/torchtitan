@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "alignment": [
+    {
+      "name": "one_token",
+      "input": [7], "labels": [-100], "documents": [0], "positions": [0],
+      "expected": {"mtp_input": [0], "mtp_labels": [-100], "mtp_input_valid_mask": [false], "mtp_positions": [0], "mtp_valid_tokens": 0}
+    },
+    {
+      "name": "two_tokens",
+      "input": [7, 8], "labels": [8, -100], "documents": [0, 0], "positions": [0, 1],
+      "expected": {"mtp_input": [8, 0], "mtp_labels": [-100, -100], "mtp_input_valid_mask": [true, false], "mtp_positions": [1, 0], "mtp_valid_tokens": 0}
+    },
+    {
+      "name": "packed_prompt_answer",
+      "input": [10, 11, 12, 20, 21, 22, 23, 24],
+      "labels": [-100, 12, -100, -100, 22, 23, 24, -100],
+      "documents": [0, 0, 0, 1, 1, 1, 1, 1], "positions": [0, 1, 2, 0, 1, 2, 3, 4],
+      "expected": {"mtp_input": [11, 12, 0, 21, 22, 23, 24, 0], "mtp_labels": [12, -100, -100, 22, 23, 24, -100, -100], "mtp_input_valid_mask": [true, true, false, true, true, true, true, false], "mtp_positions": [1, 2, 0, 1, 2, 3, 4, 0], "mtp_valid_tokens": 4}
+    },
+    {
+      "name": "all_prompt",
+      "input": [4, 5, 6, 7], "labels": [-100, -100, -100, -100], "documents": [0, 0, 0, 0], "positions": [0, 1, 2, 3],
+      "expected": {"mtp_input": [5, 6, 7, 0], "mtp_labels": [-100, -100, -100, -100], "mtp_input_valid_mask": [true, true, true, false], "mtp_positions": [1, 2, 3, 0], "mtp_valid_tokens": 0}
+    },
+    {
+      "name": "eos_and_padding",
+      "input": [4, 5, 9, 0], "labels": [5, 9, -100, -100], "documents": [0, 0, 0, 1], "positions": [0, 1, 2, 0], "padding_mask": [false, false, false, true],
+      "expected": {"mtp_input": [5, 9, 0, 0], "mtp_labels": [9, -100, -100, -100], "mtp_input_valid_mask": [true, true, false, false], "mtp_positions": [1, 2, 0, 0], "mtp_valid_tokens": 1}
+    },
+    {
+      "name": "padding_source_and_destination",
+      "input": [3, 4, 5, 6], "labels": [4, 5, 6, -100], "documents": [0, 0, 0, 0], "positions": [0, 1, 2, 3], "padding_mask": [false, true, false, false],
+      "expected": {"mtp_input": [0, 0, 6, 0], "mtp_labels": [-100, -100, -100, -100], "mtp_input_valid_mask": [false, false, true, false], "mtp_positions": [0, 0, 3, 0], "mtp_valid_tokens": 0}
+    },
+    {
+      "name": "image_mrope",
+      "input": [10, 99, 99, 11, 12, 20, 21, 0], "labels": [-100, -100, 11, 12, -100, 21, -100, -100],
+      "documents": [0, 0, 0, 0, 0, 1, 1, 2], "positions": [0, 1, 2, 3, 4, 0, 1, 0], "padding_mask": [false, false, false, false, false, false, false, true],
+      "mrope_positions": [[0, 0, 0], [1, 0, 0], [1, 0, 1], [2, 2, 2], [3, 3, 3], [0, 0, 0], [1, 1, 1], [0, 0, 0]],
+      "vision_bank_indices": [-1, 0, 1, -1, -1, -1, -1, -1],
+      "expected": {"mtp_input": [99, 99, 11, 12, 0, 21, 0, 0], "mtp_labels": [-100, 11, 12, -100, -100, -100, -100, -100], "mtp_input_valid_mask": [true, true, true, true, false, true, false, false], "mtp_positions": [[1, 0, 0], [1, 0, 1], [2, 2, 2], [3, 3, 3], [0, 0, 0], [1, 1, 1], [0, 0, 0], [0, 0, 0]], "mtp_vision_bank_indices": [0, 1, -1, -1, -1, -1, -1, -1], "mtp_valid_tokens": 2}
+    }
+  ],
+  "training": {
+    "seed": 42,
+    "text": "The workshop opens at nine. Engineers inspect the instruments, record the measurements, and discuss the results. Each measurement is checked against a reference before the next experiment begins.",
+    "image": {"pattern": "seeded_normal", "seed": 43, "grid_thw": [1, 4, 4], "supervise_text_after_image": true},
+    "learning_updates": 10
+  }
+}
