@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 import logging
 from typing import Any, TYPE_CHECKING
 
@@ -11,16 +13,17 @@ import torch
 import torch.nn as nn
 from torch.distributed._composable.fsdp import FSDPModule
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import (
-    CPUOffloadPolicy,
-    DataParallelMeshDims,
-    fully_shard,
-    MixedPrecisionPolicy,
-)
+from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 from torch.distributed.tensor import Shard
+
+try:
+    from torch.distributed.fsdp import DataParallelMeshDims
+except ImportError:
+    DataParallelMeshDims = None
 
 from torchtitan.config import FSDPSymmMemScope
 from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.distributed.utils import get_layer_containers
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,12 @@ def resolve_fsdp_mesh(
         # pass a DataParallelMeshDims object to FSDP.
         return storage_mesh, None
 
+    if DataParallelMeshDims is None:
+        raise RuntimeError(
+            "This full-mesh FSDP path requires DataParallelMeshDims; "
+            "use a local-parameter DP submesh adapter on PyTorch 2.11"
+        )
+
     shard_axes = ["dp_shard"]
     if parallel_dims.cp_enabled:
         shard_axes.append("cp")
@@ -74,6 +83,8 @@ def resolve_sparse_fsdp_mesh(
     """
     if not parallel_dims.ep_enabled:
         return None, None
+    if DataParallelMeshDims is None:
+        raise RuntimeError("Expert-parallel FSDP requires DataParallelMeshDims")
     sparse_mesh = parallel_dims.get_activated_mesh(_SPARSE_STORAGE_AXES)
     assert sparse_mesh is not None
     replicate = "dp_replicate" if parallel_dims.dp_replicate_enabled else None
@@ -169,8 +180,9 @@ def apply_fsdp_to_vision_encoder(
         "mesh": dp_mesh,
         "mp_policy": mp_policy,
         "reshard_after_forward": reshard_after_forward,
-        "dp_mesh_dims": dp_mesh_dims,
     }
+    if dp_mesh_dims is not None:
+        fsdp_config["dp_mesh_dims"] = dp_mesh_dims
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
     fully_shard(vision_encoder, **fsdp_config)
@@ -189,6 +201,9 @@ def apply_fsdp_to_decoder(
     dp_mesh_dims: "DataParallelMeshDims | None" = None,
     edp_mesh_dims: "DataParallelMeshDims | None" = None,
     symm_mem_scope: FSDPSymmMemScope = None,
+    separate_lm_head: bool = False,
+    *,
+    extra_layer_names: tuple[str, ...] = (),
 ):
     """
     Apply data parallelism (via FSDP2) to a decoder-style transformer model.
@@ -229,6 +244,8 @@ def apply_fsdp_to_decoder(
         edp_mesh_dims: Sibling of ``dp_mesh_dims`` for the sparse SPMD mesh
             used by routed experts.
         symm_mem_scope: Which FSDP modules use symmetric-memory communication.
+        separate_lm_head: Keep norm out of the chunked head backward's FSDP unit.
+        extra_layer_names: Additional disjoint block containers, in forward order.
     """
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
@@ -244,6 +261,13 @@ def apply_fsdp_to_decoder(
     reshard_after_forward = get_fsdp_reshard_after_forward_policy(
         reshard_after_forward_policy, pp_enabled
     )
+    transformer_blocks = [
+        block
+        for _, layers in get_layer_containers(
+            model, extra_layer_names=extra_layer_names
+        )
+        for block in layers.children()
+    ]
 
     if model.enable_weight_tying:
         # When weights are tied, tok_embeddings and output share the same parameter.
@@ -267,14 +291,25 @@ def apply_fsdp_to_decoder(
             )
         # As an optimization, do not reshard_after_forward the last layers
         # by default since FSDP would prefetch them immediately.
-        if model.norm is not None and model.lm_head is not None:
+        if separate_lm_head:
+            # Chunked CE runs multiple head backwards before decoder backward.
+            # Sharing its unit with norm mixes accumulated FP32 head gradients
+            # with fresh BF16 norm gradients on PyTorch 2.11.
+            for module in (model.norm, model.lm_head):
+                if module is not None:
+                    fully_shard(
+                        module,
+                        **fsdp_config,
+                        reshard_after_forward=reshard_after_forward_policy == "always",
+                    )
+        elif model.norm is not None and model.lm_head is not None:
             fully_shard(
                 [model.norm, model.lm_head],
                 **fsdp_config,
                 reshard_after_forward=reshard_after_forward_policy == "always",
             )
 
-    for layer_id, transformer_block in model.layers.items():
+    for transformer_block in transformer_blocks:
         # NOTE: In an MoE layer, we use shard_placement_fn to apply different
         # FSDP mesh and shard placement to different parameters:
         # - When EP > 1: routed experts use edp_mesh, other params use dp_mesh
@@ -396,10 +431,9 @@ def apply_fsdp_to_decoder(
         return
 
     # set up explicit prefetching when EP is enabled for forward
-    transformer_blocks = list(model.layers.values())
     next_transformer_blocks = transformer_blocks[1:] + [None]
 
-    if model.tok_embeddings is not None and len(model.layers) > 0:
+    if model.tok_embeddings is not None and transformer_blocks:
         model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
 
     for transformer_block, next_transformer_block in zip(
@@ -414,20 +448,20 @@ def apply_fsdp_to_decoder(
                 [model.norm, model.lm_head]
             )
 
+    # fully_shard adds the prefetch methods dynamically to each block.
     # set up explicit prefetching when EP is enabled for backward
-    # pyrefly: ignore [no-matching-overload]
-    reversed_transformer_blocks = list(reversed(model.layers.values()))
+    reversed_transformer_blocks = list(reversed(transformer_blocks))
     prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
 
-    if model.norm is not None and model.lm_head is not None and len(model.layers) > 0:
+    if model.norm is not None and model.lm_head is not None and transformer_blocks:
         model.lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
 
     for transformer_block, prev_transformer_block in zip(
         reversed_transformer_blocks, prev_transformer_blocks
     ):
         if prev_transformer_block is not None:
-            # pyrefly: ignore [missing-attribute]
+            # pyrefly: ignore [not-callable]
             transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
         elif model.tok_embeddings is not None:
-            # pyrefly: ignore [missing-attribute]
+            # pyrefly: ignore [not-callable]
             transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])

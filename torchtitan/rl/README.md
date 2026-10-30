@@ -175,13 +175,13 @@ uv pip install --no-deps "git+https://github.com/meta-pytorch/torchstore.git@mai
 # Hopper (H100/H200, SM90): Flash Attention 3
 uv pip install flash-attn-3 --extra-index-url=https://download.pytorch.org/whl/test/cu130
 
-# sm100_family (SM100_NVLINK/SM103_NVLINK, SM100): Flash Attention 4
+# SM100 family (SM100_NVLINK/SM103_NVLINK, SM100): Flash Attention 4
 # Newer FA4 betas require apache-tvm-ffi>=0.1.12, but vLLM pins 0.1.11.
 # Qwen3.5 hd256 paged attention requires the fixes in FA4 b31.
 uv pip install "flash-attn-4[cu13]>=4.0.0b31"
 ```
 
-TorchTitan selects FA4 on sm100_family, FA3 on Hopper, and the FA2 implementation
+TorchTitan selects FA4 on SM100 family, FA3 on Hopper, and the FA2 implementation
 bundled with PyTorch on older GPUs such as A100.
 
 3. Install batch-invariant ops if you need to run batch-invariant mode (Triton kernels for bitwise-reproducible training):

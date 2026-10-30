@@ -41,6 +41,13 @@ Documentation = "https://github.com/pytorch/torchtitan/tree/main/docs"
 Issues = "https://github.com/pytorch/torchtitan/issues"
 
 [project.optional-dependencies]
+"SenseNova-Loop-9B-Preview" = [
+    "transformers==5.18.0",
+    "binpacking==2.0.1",
+    "qwen-vl-utils==0.0.14",
+    "flash-attn==2.8.3",
+    "nvidia-cutlass-dsl==4.6.2",
+]
 dev = [
     "pre-commit",
     "pytest",

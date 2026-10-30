@@ -41,6 +41,7 @@ def parallelize_qwen3_5(
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
     skip_dp: bool = False,
+    extra_layer_names: tuple[str, ...] = (),
 ):
     """
     Apply tensor parallelism, activation checkpointing, torch.compile, and data
@@ -56,18 +57,20 @@ def parallelize_qwen3_5(
         compile_config is not None and "model" in compile_config.components
     )
 
-    if parallel_dims.cp_enabled:
+    # Only adapters that supply CP-safe GDN, vision scatter and attention
+    # metadata can opt in. Native Qwen3.5 retains the unsupported-path guard.
+    if parallel_dims.cp_enabled and not getattr(model, "_qwen35_cp_supported", False):
         raise NotImplementedError(
             "Context Parallel is not yet supported for Qwen3.5. "
-            "GatedDeltaNet (75% of layers) requires full-sequence allgather, "
-            "and multimodal CP needs vision scatter before CP sharding."
+            "Use an adapter with CP-safe GatedDeltaNet and vision scatter "
+            "before CP sharding."
         )
 
     model.parallelize(parallel_dims)  # pyrefly: ignore [not-callable]
 
     if ac_config is not None:
         ac_policy = ac_config.build(dump_folder=dump_folder)
-        ac_policy.apply(model)
+        ac_policy.apply(model, extra_layer_names=extra_layer_names)
         if model.vision_encoder is not None:
             ac_policy.apply(model.vision_encoder)
 
@@ -116,6 +119,7 @@ def parallelize_qwen3_5(
         dp_mesh_dims=dp_mesh_dims,
         edp_mesh_dims=edp_mesh_dims,
         symm_mem_scope=parallelism.fsdp_symm_mem_scope,
+        extra_layer_names=extra_layer_names,
     )
 
     return model

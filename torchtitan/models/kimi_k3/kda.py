@@ -89,7 +89,7 @@ class KDAKernel(Module):
         capability = torch.cuda.get_device_capability(q_1THK.device)
         if capability not in {(10, 0), (10, 3)}:
             raise RuntimeError(
-                "Attention Gym KDA requires sm100_family SM100/SM103; "
+                "Attention Gym KDA requires SM100/SM103; "
                 f"got CUDA capability {capability}."
             )
 

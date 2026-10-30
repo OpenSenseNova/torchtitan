@@ -411,6 +411,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.train_context = dist_utils.get_spmd_context(
             parallel_dims=self.parallel_dims,
             spmd_typechecking=self.config.debug.spmd_typechecking,
+            activation_reduce_dtype=TORCH_DTYPE_MAP.get(
+                self.config.parallelism.activation_reduce_dtype
+            ),
         )
         if self.parallel_dims.pp_enabled:
             self.forward_backward_body_fn = cast(
@@ -648,17 +651,20 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             return torch.sum(torch.stack(detached_losses)).to(self.device)
         return self._pp_loss_sentinel_on_non_last_stage
 
-    @sl.log_trace_span("optimizer_step")
-    def optimizer_step(self) -> torch.Tensor:
-        """Validate gradients, then advance optimizer and learning-rate scheduler."""
-        current_step = self.num_completed_steps + 1
-        grad_norm = dist_utils.clip_grad_norm_(
+    def clip_grad_norm(self) -> torch.Tensor:
+        return dist_utils.clip_grad_norm_(
             [p for model in self.model_parts for p in model.parameters()],
             self.config.training.max_norm,
             foreach=True,
             pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
             ep_enabled=self.parallel_dims.ep_enabled,
         )
+
+    @sl.log_trace_span("optimizer_step")
+    def optimizer_step(self, *, update: bool = True) -> torch.Tensor:
+        """Validate a consumed step and optionally update optimizer/scheduler."""
+        current_step = self.num_completed_steps + 1
+        grad_norm = self.clip_grad_norm()
         if not self.parallel_dims.pp_enabled or self.pp_has_last_stage:
             loss_mesh = self.parallel_dims.get_optional_mesh("loss")
             if loss_mesh is not None:
@@ -684,10 +690,13 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         )
         if hasattr(self, "checkpointer"):
             self.checkpointer.maybe_wait_for_staging()
-        self.optimizers.step()
-        self.lr_schedulers.step()
+        if update:
+            self.optimizers.step()
+            self.lr_schedulers.step()
+            self._num_optimizer_steps_since_cuda_graph_init += 1
+        else:
+            self.optimizers.zero_grad(set_to_none=True)
         self.num_completed_steps = current_step
-        self._num_optimizer_steps_since_cuda_graph_init += 1
         return grad_norm
 
     def state_dict(self) -> dict[str, Any]:

@@ -178,6 +178,16 @@ class ParallelismConfig:
     enable_sequence_parallel: bool = True
     """Whether to use SequenceParallel as part of tensor parallelism. Enabled by default."""
 
+    activation_reduce_dtype: Annotated[
+        Literal["float32"] | None, tyro.conf.Suppress
+    ] = None
+    """Accumulation dtype for SPMD activation reductions, including backward.
+
+    None preserves each operator's policy. This is separate from FSDP parameter
+    gradient reduction. Float32 avoids reducing BF16 partials in the activation
+    dtype while keeping gather and all-to-all payloads unchanged.
+    """
+
     pipeline_parallel_degree: int = 1
     """
     Pipeline Parallelism degree, or number of ranks. 1 means disabled.

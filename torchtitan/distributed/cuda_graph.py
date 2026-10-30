@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from torch.cuda._graph_annotations import get_kernel_annotations
 from torch.nn.attention.flex_attention import BlockMask
 from torch.utils import _pytree as pytree
 
@@ -337,6 +336,8 @@ class CUDAGraphWrapper:
                 capture_error_mode="thread_local",
             ):
                 self._output = self._fn(*args)
+            from torch.cuda._graph_annotations import get_kernel_annotations
+
             _manager.all_annotations.update(get_kernel_annotations())
             logger.info("Recorded CUDA graph")
 

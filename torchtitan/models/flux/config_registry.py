@@ -189,7 +189,7 @@ def flux_schnell() -> FluxTrainer.Config:
 
 def flux_schnell_mxfp8() -> FluxTrainer.Config:
     """Flux schnell with MXFP8 quantization and torch.compile.
-    Requires SM100+ (SM100/SM100) and torchao nightly."""
+    Requires SM100+ and torchao nightly."""
     config = flux_schnell()
     config.compile = CompileConfig()
     model_compile_enabled = (
@@ -217,7 +217,7 @@ def flux_schnell_mxfp8() -> FluxTrainer.Config:
 
 def flux_dev_mxfp8() -> FluxTrainer.Config:
     """Flux dev with MXFP8 quantization and torch.compile.
-    Requires SM100+ (SM100/SM100) and torchao nightly."""
+    Requires SM100+ and torchao nightly."""
     config = flux_dev()
     config.compile = CompileConfig()
     model_compile_enabled = (

@@ -1,9 +1,9 @@
-## Experimental NVFP4 Training on sm100_family GPUs
+## Experimental NVFP4 Training on SM100 family GPUs
 
 NVFP4 training dynamically quantizes linear GEMM activations, weights, and
 gradients to NVFP4 through TorchAO's training prototype. The model weights and
 distributed collectives remain in bf16. This reduces memory use and can improve
-throughput on NVIDIA sm100_family GPUs.
+throughput on NVIDIA SM100 family GPUs.
 
 > [!WARNING]
 > NVFP4 training is experimental. It depends on a TorchAO prototype and has no
@@ -13,7 +13,7 @@ throughput on NVIDIA sm100_family GPUs.
 
 ### Requirements
 
-- NVIDIA sm100_family SM100 or later GPU with CUDA.
+- NVIDIA SM100 family SM100 or later GPU with CUDA.
 - A PyTorch and TorchAO build that provides
   `torchao.prototype.moe_training.nvfp4_training`.
 - `torch.compile` for competitive performance. The provided

@@ -464,18 +464,19 @@ class Qwen35Model(Decoder):
     ) -> Qwen35AttentionMaskDict:
         attn_config = self.config.first_attention
 
-        # Multimodal padding uses position 0 for every padded token. A real
-        # document start is position 0 followed by position 1; keep index 0 as
-        # the first start. This avoids routing a single padded sample through
-        # the varlen kernel while retaining boundaries between packed samples.
-        followed_by_one = torch.cat(
-            [
-                positions[1:] == 1,
-                torch.zeros(1, dtype=torch.bool, device=positions.device),
-            ]
-        )
+        # Every valid position reset starts a document, including a one-token
+        # document. Looking ahead for position 1 incorrectly merges singletons
+        # into the preceding document. Padding is identified by its explicit
+        # mask, and each contiguous padding run forms one separate segment.
+        sequence_starts = positions == 0
+        if padding_mask is not None:
+            padding = padding_mask.to(torch.bool)
+            previous_padding = torch.cat([torch.zeros_like(padding[:1]), padding[:-1]])
+            sequence_starts = (sequence_starts & ~padding) | (
+                padding & ~previous_padding
+            )
         first_token = torch.arange(positions.shape[0], device=positions.device) == 0
-        sequence_starts = ((positions == 0) & followed_by_one) | first_token
+        sequence_starts = sequence_starts | first_token
         sequence_positions = torch.where(sequence_starts, 0, 1)
         deltanet_metadata = create_varlen_metadata_for_document(
             sequence_positions,

@@ -222,6 +222,26 @@ class TestAllGatherCollective(unittest.TestCase):
     def test_float32_kv_reach_the_reducing_backward(self):
         for _, grad in self._gather_and_backward(torch.float32):
             self.assertEqual(torch.float32, grad.dtype)
+            torch.testing.assert_close(grad, torch.ones_like(grad), rtol=0, atol=0)
+
+    def test_non_contiguous_kv_gradient_keeps_values(self):
+        kernel = KVAllGatherCPFlexInnerAttention(
+            KVAllGatherCPFlexInnerAttention.Config()
+        )
+        q, k, v = (
+            torch.randn(4, 2, 8, requires_grad=True) for _ in range(3)
+        )
+        gradient = torch.arange(64, dtype=torch.float32).reshape(8, 2, 4).transpose(0, 2)
+        self.assertFalse(gradient.is_contiguous())
+        with mock.patch(
+            "torchtitan.models.common.cp_attention.spmd_mesh_group",
+            return_value=dist.group.WORLD,
+        ), mock.patch.object(
+            FlexInnerAttention, "forward", lambda self, q, k, v, **kw: k + v
+        ):
+            kernel.forward(q, k, v).backward(gradient)
+        torch.testing.assert_close(k.grad, gradient, rtol=0, atol=0)
+        torch.testing.assert_close(v.grad, gradient, rtol=0, atol=0)
 
 
 class TestUlysses(unittest.TestCase):

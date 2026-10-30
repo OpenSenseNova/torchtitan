@@ -341,6 +341,12 @@ class Trainer(Configurable):
             # Tensors stay on CPU; moved to GPU per-microbatch during training
             yield microbatch
 
+    def prepare_step_microbatches(
+        self, microbatch_groups: list[list[TrainingMicrobatch]]
+    ) -> list[list[TrainingMicrobatch]]:
+        """Prepare the complete prefetched step without advancing the loader."""
+        return microbatch_groups
+
     def train_step(self, data_iterator: Iterator[TrainingMicrobatch]):
         engine = self.engine
         current_step = engine.num_completed_steps + 1
@@ -378,6 +384,8 @@ class Trainer(Configurable):
         else:
             global_valid_tokens = local_valid_tokens_tensor
 
+        microbatch_groups = self.prepare_step_microbatches(microbatch_groups)
+
         # Auxiliary losses normalize by the same per-step token count as the
         # main loss, so their scale is independent of parallelism degrees.
         global_valid_tokens = engine.prepare_step(
@@ -412,6 +420,26 @@ class Trainer(Configurable):
 
         assert accumulated_loss is not None
 
+        self.log_step_metrics(
+            accumulated_loss=accumulated_loss,
+            local_valid_tokens=local_valid_tokens,
+            global_valid_tokens=global_valid_tokens,
+            grad_norm=grad_norm,
+            lr_metrics=lr_metrics,
+        )
+
+    def log_step_metrics(
+        self,
+        *,
+        accumulated_loss: torch.Tensor,
+        local_valid_tokens: int,
+        global_valid_tokens: torch.Tensor,
+        grad_norm: torch.Tensor,
+        lr_metrics: dict[str, float],
+    ) -> None:
+        """Reduce and record metrics after the optimizer step."""
+        engine = self.engine
+        parallel_dims = engine.parallel_dims
         with sl.log_trace_span("collect_dist_metrics"):
             sl.log_trace_scalar({"global_valid_tokens": int(global_valid_tokens)})
 
@@ -466,7 +494,8 @@ class Trainer(Configurable):
 
         sl.log_trace_instant("training_start")
 
-        engine.load_checkpoint()
+        resumed = engine.load_checkpoint()
+        self.on_checkpoint_loaded(resumed)
 
         # Capture loaded step for relative_step calculation.
         # After checkpoint load, this is the restored number of completed updates.
@@ -524,6 +553,10 @@ class Trainer(Configurable):
             time.sleep(2)
 
         logger.info("Training completed")
+
+    def on_checkpoint_loaded(self, resumed: bool) -> None:
+        """Initialize owner state after loading and before consuming any data."""
+        pass
 
     def should_continue_training(self) -> bool:
         return self.engine.num_completed_steps < self.config.training.steps

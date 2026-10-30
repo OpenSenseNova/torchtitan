@@ -52,3 +52,17 @@ CLAUDE_CONTEXT/
 
 # Lychee (link checker) cache
 .lycheecache
+
+# Local training outputs and compilation caches
+/.cache/
+/output/
+
+# Local test caches and reports
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+/htmlcov/
+/test-results/
+/test-artifacts/

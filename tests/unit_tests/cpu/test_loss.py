@@ -4,8 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 import unittest
 from dataclasses import dataclass
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -319,7 +321,32 @@ class TestGradAccumulator(unittest.TestCase):
             acc.add(torch.randn(4, 16))
 
 
-class TestLossParallelCrossEntropy(DTensorTestBase):
+class _TCPDTensorTestBase(DTensorTestBase):
+    """Use TCP rendezvous so distributed tests also work on network filesystems."""
+
+    @property
+    def device_type(self):
+        return "cpu"
+
+    def _spawn_processes(self):
+        self._test_store = dist.TCPStore(
+            "127.0.0.1", 0, is_master=True, wait_for_workers=False
+        )
+        with patch.dict(os.environ, {"TITAN_TEST_STORE_PORT": str(self._test_store.port)}):
+            super()._spawn_processes()
+
+    def init_pg(self, eager_init, backend=None):
+        store = dist.TCPStore(
+            "127.0.0.1", int(os.environ["TITAN_TEST_STORE_PORT"]),
+            is_master=False, timeout=timedelta(seconds=120),
+        )
+        dist.init_process_group(
+            backend=backend or "gloo", store=store,
+            rank=self.rank, world_size=self.world_size,
+        )
+
+
+class TestLossParallelCrossEntropy(_TCPDTensorTestBase):
     @property
     def world_size(self):
         return 4
@@ -391,11 +418,20 @@ class TestLossParallelCrossEntropy(DTensorTestBase):
                         label_placements,
                     )
 
-                    # pytorch loss_parallel() as ground truth.
+                    # Evaluate the reference on each DP shard's TP submesh.
+                    # PyTorch 2.11 loss_parallel accepts only a 1D mesh.
+                    reference_logits = DTensor.from_local(
+                        logits_dtensor.to_local().detach(), mesh["tp"], [Shard(1)],
+                        shape=torch.Size((T // (mesh["dp"].size() if "dp" in axis_names else 1), vocab_size)),
+                        stride=(vocab_size, 1),
+                    ).requires_grad_(True)
+                    reference_labels = DTensor.from_local(
+                        labels_dtensor.to_local(), mesh["tp"], [Replicate()]
+                    )
                     with loss_parallel():
                         wrapper_loss = F.cross_entropy(
-                            logits_dtensor.float(),
-                            labels_dtensor,
+                            reference_logits.float(),
+                            reference_labels,
                             reduction="sum",
                             ignore_index=IGNORE_INDEX,
                         )
@@ -442,10 +478,14 @@ class TestLossParallelCrossEntropy(DTensorTestBase):
                         shape=torch.Size((T, vocab_size)),
                         stride=(vocab_size, 1),
                     )
+                    reference_grad_dtensor = DTensor.from_local(
+                        reference_logits.grad.to_local(), mesh, logits_placements,
+                        shape=torch.Size((T, vocab_size)), stride=(vocab_size, 1),
+                    )
                     self.assertTrue(
                         torch.equal(
                             local_grad_dtensor.full_tensor(),
-                            logits_dtensor.grad.full_tensor(),
+                            reference_grad_dtensor.full_tensor(),
                         )
                     )
 
@@ -657,6 +697,10 @@ class _RecordingFSDPLinear(nn.Linear):
     def __init__(self, *args, events: list[str], **kwargs):
         super().__init__(*args, **kwargs)
         self.events = events
+        self.param_group = SimpleNamespace(reduce_grads=True, all_reduce_grads=False)
+
+    def _get_fsdp_state(self):
+        return SimpleNamespace(_fsdp_param_group=self.param_group)
 
     def set_reshard_after_forward(self, enabled):
         self.events.append(f"set_reshard_after_forward({enabled})")
@@ -666,6 +710,11 @@ class _RecordingFSDPLinear(nn.Linear):
 
     def set_requires_gradient_sync(self, enabled, *, recurse):
         self.events.append(f"gradient_sync({enabled})")
+        self.param_group.reduce_grads = enabled
+        self.param_group.all_reduce_grads = enabled
+
+    def set_requires_all_reduce(self, enabled, *, recurse):
+        self.param_group.all_reduce_grads = enabled
 
     def unshard(self):
         self.events.append("unshard")
@@ -679,6 +728,137 @@ class _RecordingFSDPLinear(nn.Linear):
 
 
 class TestChunkedLossWrapper(unittest.TestCase):
+    def test_per_output_gradients_and_scalar_step_denominator(self):
+        for mask in ((False, True), (True, False), (True, True), (False, False)):
+            for freeze_head in (False, True):
+                with self.subTest(mask=mask, freeze_head=freeze_head):
+                    torch.manual_seed(42)
+                    head = nn.Linear(5, 17, bias=False)
+                    reference_head = nn.Linear(5, 17, bias=False)
+                    reference_head.load_state_dict(head.state_dict())
+                    head.requires_grad_(not freeze_head)
+                    reference_head.requires_grad_(not freeze_head)
+                    hidden = tuple(
+                        torch.randn(8, 5).requires_grad_(flag) for flag in mask
+                    )
+                    reference = tuple(
+                        h.detach().clone().requires_grad_(flag)
+                        for h, flag in zip(hidden, mask)
+                    )
+                    labels = (
+                        torch.tensor([1, 2, -100, 4, 5, 6, 7, 8]),
+                        torch.tensor([2, -100, 4, 5, 6, 7, 8, -100]),
+                    )
+                    denominator = torch.tensor(5)
+                    token_weights = torch.arange(1, 9, dtype=torch.float32)
+                    observed = []
+
+                    def objective(
+                        logits,
+                        targets,
+                        global_valid_tokens,
+                        *,
+                        auxiliary_count,
+                        weights,
+                        metadata,
+                    ):
+                        observed.append((auxiliary_count, metadata))
+                        main = F.cross_entropy(logits[0], targets[0], reduction="sum")
+                        auxiliary = (
+                            F.cross_entropy(logits[1], targets[1], reduction="none")
+                            * weights
+                        ).sum()
+                        loss = (
+                            main / global_valid_tokens
+                            + 0.3 * auxiliary / auxiliary_count
+                        )
+                        return loss, {
+                            "auxiliary/sum": auxiliary.detach(),
+                            "tokens/sum": (targets[1] != -100).sum(),
+                        }
+
+                    wrapper = ChunkedLossWrapper(
+                        ChunkedLossWrapper.Config(num_chunks=4)
+                    )
+                    wrapper.set_lm_head(head)
+                    wrapper.loss_fn = objective
+                    kwargs = dict(
+                        auxiliary_count=denominator,
+                        weights=token_weights,
+                        metadata=("step", 7),
+                    )
+                    expected, expected_metrics = objective(
+                        tuple(reference_head(h) for h in reference), labels, 7, **kwargs
+                    )
+                    actual, metrics = wrapper(hidden, labels, 7, **kwargs)
+                    torch.testing.assert_close(actual, expected)
+                    self.assertEqual(metrics["tokens/sum"], 6)
+                    torch.testing.assert_close(
+                        metrics["auxiliary/sum"], expected_metrics["auxiliary/sum"]
+                    )
+                    self.assertTrue(
+                        all(
+                            count is denominator and metadata == ("step", 7)
+                            for count, metadata in observed
+                        )
+                    )
+                    if any(mask):
+                        expected.backward()
+                        actual.backward()
+                        for actual_hidden, expected_hidden in zip(hidden, reference):
+                            torch.testing.assert_close(
+                                actual_hidden.grad, expected_hidden.grad
+                            )
+                        torch.testing.assert_close(
+                            head.weight.grad, reference_head.weight.grad
+                        )
+                        for h, flag in zip(hidden, mask):
+                            if flag:
+                                self.assertGreater(h.grad.abs().sum(), 0)
+                    else:
+                        self.assertFalse(actual.requires_grad)
+                        self.assertIsNone(head.weight.grad)
+                    for h, flag in zip(hidden, mask):
+                        if not flag:
+                            self.assertIsNone(h.grad)
+                    if freeze_head:
+                        self.assertIsNone(head.weight.grad)
+
+    def test_rejects_mismatched_token_kwarg_length(self):
+        _, wrapper = self._make_model_and_loss(num_chunks=2)
+        with self.assertRaisesRegex(RuntimeError, "same sequence length"):
+            wrapper(
+                torch.randn(8, 32),
+                torch.ones(8, dtype=torch.long),
+                weights=torch.ones(4),
+            )
+
+    def test_frozen_head_mixed_outputs_restore_fsdp_sync_state(self):
+        events = []
+        head = _RecordingFSDPLinear(4, 8, bias=False, events=events).requires_grad_(
+            False
+        )
+        wrapper = ChunkedLossWrapper(
+            ChunkedLossWrapper.Config(
+                num_chunks=2, loss_fn=_WeightedTwoOutputLoss.Config()
+            )
+        )
+        wrapper.set_lm_head(head)
+        hidden = (torch.randn(4, 4), torch.randn(4, 4, requires_grad=True))
+        labels = tuple(torch.randint(0, 8, (4,)) for _ in range(2))
+        with patch(
+            "torch.distributed._composable.fsdp.FSDPModule", _RecordingFSDPLinear
+        ):
+            value, _ = wrapper(hidden, labels)
+            value.backward()
+        self.assertIsNone(hidden[0].grad)
+        self.assertGreater(hidden[1].grad.abs().sum(), 0)
+        self.assertIsNone(head.weight.grad)
+        self.assertEqual(events.count("unshard"), 1)
+        self.assertEqual(events.count("reshard"), 1)
+        self.assertTrue(head.param_group.reduce_grads)
+        self.assertFalse(head.param_group.all_reduce_grads)
+
     def _make_model_and_loss(self, dim=32, vocab_size=64, num_chunks=4):
         """Create a fake Decoder and ChunkedLossWrapper for testing."""
         model = _FakeDecoder(dim, vocab_size)
@@ -940,6 +1120,9 @@ class TestChunkedLossWrapper(unittest.TestCase):
         events: list[str] = []
 
         class FakeFSDPLinear(nn.Linear):
+            def _get_fsdp_state(self):
+                return SimpleNamespace(_fsdp_param_group=None)
+
             def set_reshard_after_forward(self, enabled):
                 events.append(f"set_reshard_after_forward({enabled})")
 
@@ -1080,13 +1263,18 @@ class TestChunkedLossWrapper(unittest.TestCase):
                 tensor,
                 0,
                 hint_override=T,
-                min=num_chunks,
-                max=T,
                 specialize_on=[lambda extent, hint=T: extent == hint],
             )
 
+        def bounded_loss(hidden, targets):
+            # Explicit constraints work with both old and new mark_unbacked APIs.
+            for tensor in (hidden, targets):
+                torch._check(tensor.shape[0] >= num_chunks)
+                torch._check(tensor.shape[0] <= T)
+            return chunked_loss(hidden, targets)
+
         traced = make_fx(
-            chunked_loss,
+            bounded_loss,
             tracing_mode="symbolic",
             _allow_non_fake_inputs=True,
         )(hidden_states, labels)
@@ -1136,7 +1324,7 @@ class TestChunkedLossWrapper(unittest.TestCase):
         torch.testing.assert_close(loss, expected_loss)
 
 
-class TestChunkedLossWrapperSPMD(DTensorTestBase):
+class TestChunkedLossWrapperSPMD(_TCPDTensorTestBase):
     @property
     def world_size(self):
         return 2

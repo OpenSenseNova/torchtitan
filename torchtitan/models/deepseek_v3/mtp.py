@@ -7,12 +7,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import spmd_types as spmd
 import torch
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import DataParallelMeshDims
 
 from torchtitan.components.loss import CrossEntropyLoss, IGNORE_INDEX
 from torchtitan.config import CompileConfig, FSDPSymmMemScope, ParallelismConfig
@@ -30,94 +29,13 @@ from torchtitan.models.common.attention import (
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.decoder_sharding import decoder_input_sharding
 from torchtitan.models.common.linear import Linear
+
+from torchtitan.models.common.mtp import roll_mtp_sequence
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.protocols.module import ModuleList
 
-
-def roll_mtp_sequence(
-    sequence: torch.Tensor,
-    *,
-    shift: int,
-    fill_value: int,
-    positions: torch.Tensor | None = None,
-    padding_mask: torch.Tensor | None = None,
-    return_valid_mask: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Left-roll an MTP sequence while preserving packed-document boundaries.
-
-    MTP depth ``k`` needs the token or label at ``i + k`` for each position
-    ``i``. This helper builds that shifted view along the token axis
-    (dimension 0). Tail positions, and positions that would cross a packed
-    document boundary, are filled instead of wrapped around.
-
-    Args:
-        sequence: Tensor to shift, with shape ``[T, ...]``. Any trailing
-            dimensions are carried along unchanged.
-        shift: Future-token offset to use. ``shift=1`` maps each position to the
-            next token, ``shift=2`` maps to the token after next, and so on.
-            Must be positive and no larger than ``seq_len``.
-        positions: Optional reset-style position IDs with shape ``[T]``. When
-            present, a shifted source position is valid only if
-            ``positions[i + shift] == positions[i] + shift``.
-            This prevents MTP inputs or labels from crossing packed-document
-            boundaries.
-        padding_mask: Optional padding mask with shape ``[T]``. A shifted
-            source position marked as padding is filled and reported invalid.
-        fill_value: Value used for invalid positions. Use token id ``0`` for
-            shifted input tokens and ``IGNORE_INDEX`` for shifted labels.
-        return_valid_mask: If true, also return a boolean mask marking positions
-            where the shifted value came from a valid source position.
-
-    Returns:
-        The shifted tensor. If ``return_valid_mask`` is true, returns
-        ``(shifted, valid_mask)``.
-
-    Example:
-        ``sequence=[A0, A1, A2, B0, B1]`` and
-        ``positions=[0, 1, 2, 0, 1]`` with ``shift=1`` returns
-        ``[A1, A2, fill, B1, fill]``.
-    """
-    seq_len = sequence.shape[0]
-    if shift <= 0 or shift > seq_len:
-        raise ValueError(f"MTP roll shift must be in [1, {seq_len}], got {shift}.")
-
-    rolled = torch.full_like(sequence, fill_value)
-    valid_mask = torch.zeros_like(sequence, dtype=torch.bool)
-
-    source = sequence[shift:]
-    if positions is None:
-        rolled[: seq_len - shift] = source
-        valid_mask[: seq_len - shift] = True
-        if padding_mask is not None:
-            valid_mask[: seq_len - shift] &= ~padding_mask[shift:seq_len]
-            rolled[: seq_len - shift] = torch.where(
-                valid_mask[: seq_len - shift],
-                source,
-                rolled[: seq_len - shift],
-            )
-        if return_valid_mask:
-            return rolled, valid_mask
-        return rolled
-
-    if positions.shape[0] < seq_len:
-        raise ValueError(
-            f"MTP positions need at least {seq_len} tokens, got {positions.shape[0]}."
-        )
-    valid_tokens = positions[shift:seq_len] == positions[: seq_len - shift] + shift
-    if padding_mask is not None:
-        valid_tokens &= ~padding_mask[shift:seq_len]
-    # valid_tokens follows positions placement, while valid_mask intentionally
-    # follows sequence placement for the following where.
-    with spmd.no_typecheck():
-        valid_mask[: seq_len - shift] = valid_tokens
-    rolled[: seq_len - shift] = torch.where(
-        valid_mask[: seq_len - shift],
-        source,
-        rolled[: seq_len - shift],
-    )
-    if return_valid_mask:
-        return rolled, valid_mask
-    return rolled
+if TYPE_CHECKING:
+    from torch.distributed.fsdp import DataParallelMeshDims
 
 
 class MTPTransformerBlock(TransformerBlock):
@@ -423,32 +341,21 @@ def apply_fsdp_to_mtp_decoder(
     edp_mesh_dims: DataParallelMeshDims | None = None,
     symm_mem_scope: FSDPSymmMemScope = None,
 ) -> None:
-    mtp_layer_keys = []
-    try:
-        if model.mtp_layers is not None:
-            first_mtp_layer_id = len(model.layers)
-            for i, layer in enumerate(model.mtp_layers):
-                key = str(first_mtp_layer_id + i)
-                model.layers[key] = layer
-                mtp_layer_keys.append(key)
-
-        apply_fsdp_to_decoder(
-            model,
-            dp_mesh,
-            param_dtype=param_dtype,
-            reduce_dtype=reduce_dtype,
-            pp_enabled=pp_enabled,
-            cpu_offload=cpu_offload,
-            reshard_after_forward_policy=reshard_after_forward_policy,
-            ep_degree=ep_degree,
-            edp_mesh=edp_mesh,
-            dp_mesh_dims=dp_mesh_dims,
-            edp_mesh_dims=edp_mesh_dims,
-            symm_mem_scope=symm_mem_scope,
-        )
-    finally:
-        for key in mtp_layer_keys:
-            del model.layers[key]
+    apply_fsdp_to_decoder(
+        model,
+        dp_mesh,
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        pp_enabled=pp_enabled,
+        cpu_offload=cpu_offload,
+        reshard_after_forward_policy=reshard_after_forward_policy,
+        ep_degree=ep_degree,
+        edp_mesh=edp_mesh,
+        dp_mesh_dims=dp_mesh_dims,
+        edp_mesh_dims=edp_mesh_dims,
+        symm_mem_scope=symm_mem_scope,
+        extra_layer_names=("mtp_layers",) if model.mtp_layers is not None else (),
+    )
 
 
 class MTPLoss(CrossEntropyLoss):

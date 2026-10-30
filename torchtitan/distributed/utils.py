@@ -20,7 +20,6 @@ import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
 import torch.distributed.tensor._random
 import torch.distributed.tensor.parallel
-from spmd_types.checker import typecheck as spmd_typecheck
 from torch import distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
@@ -33,6 +32,20 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from torchtitan.distributed.parallel_dims import ParallelDims
+
+
+def get_layer_containers(
+    model: torch.nn.Module, *, extra_layer_names: tuple[str, ...] = ()
+) -> tuple[tuple[str, torch.nn.Module], ...]:
+    """Resolve ordered, disjoint containers for block-level parallelism."""
+    containers = tuple(
+        (name, model.get_submodule(name)) for name in ("layers", *extra_layer_names)
+    )
+    if extra_layer_names:
+        blocks = [block for _, layers in containers for block in layers.children()]
+        if len({id(block) for block in blocks}) != len(blocks):
+            raise ValueError("Layer containers must not register the same block twice")
+    return containers
 
 
 def _dist_reduce(
@@ -154,9 +167,8 @@ def set_determinism(
         # https://pytorch.org/docs/stable/generated/torch.use_deterministic_algorithms.html
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
-        from torch.nn.attention.flex_attention import flex_attention
-
         from torchtitan.models.common.attention import FlexInnerAttention
+        from torchtitan.models.common.attention_compat import flex_attention
 
         if torch.version.hip is not None:
             # Compiled ROCm flex attention is not deterministic.
@@ -274,11 +286,11 @@ def enable_fp32_matmul_emulation_with_bf16x9() -> None:
     try:
         torch.backends.cuda.matmul.fp32_precision = "bfx9"
     except (AttributeError, RuntimeError, ValueError) as exc:
-        raise ValueError(
-            "TorchTitan on NVIDIA GPUs with compute capability 10.0 or later "
-            "requires PyTorch with CUDA BFX9 matmul support "
-            "(pytorch/pytorch#195301) and CUDA 12.9 or later."
-        ) from exc
+        torch.backends.cuda.matmul.fp32_precision = "ieee"
+        logger.warning(
+            "BF16x9 FP32 emulation unavailable; using IEEE FP32 matmul: %s", exc
+        )
+        return
 
     logger.info("Enabled BF16x9 emulation for FP32 CUDA matmuls")
 
@@ -366,10 +378,14 @@ def get_spmd_context(
     *,
     parallel_dims: "ParallelDims | None" = None,
     spmd_typechecking: bool = False,
+    activation_reduce_dtype: torch.dtype | None = None,
 ) -> SpmdContext:
     @contextlib.contextmanager
     def context():
         with contextlib.ExitStack() as stack:
+            from torchtitan.distributed.spmd_types import spmd_reduction_dtype
+
+            stack.enter_context(spmd_reduction_dtype(activation_reduce_dtype))
             if parallel_dims is not None:
                 if not parallel_dims._single_axis_meshes:
                     parallel_dims.build_mesh()
@@ -386,6 +402,8 @@ def get_spmd_context(
 
                 stack.enter_context(set_current_spmd_mesh(spmd_dense_mesh()))
             if spmd_typechecking:
+                from spmd_types.checker import typecheck as spmd_typecheck
+
                 stack.enter_context(spmd_typecheck(local=False))
 
             yield
@@ -500,7 +518,7 @@ def init_distributed(
     torch.distributed.init_process_group(
         backend=_get_distributed_backend(enable_cpu_backend),
         timeout=timedelta(seconds=comm_config.init_timeout_seconds),
-        _ranks=ranks if ranks is not None else [],
+        **({"_ranks": ranks} if ranks is not None else {}),
     )
 
     return torch.distributed.get_world_size()
@@ -533,8 +551,13 @@ def set_pg_timeouts(
         mesh.get_group()
         for mesh in parallel_dims.get_all_one_dimensional_meshes().values()
     ] + [None]
+    set_timeout = getattr(torch.distributed, "set_timeout", None)
+    if set_timeout is None:
+        from torch.distributed.distributed_c10d import _set_pg_timeout
+
+        set_timeout = _set_pg_timeout
     for group in groups:
-        torch.distributed.set_timeout(timeout, group)
+        set_timeout(timeout, group)
 
 
 @torch.no_grad()

@@ -2,6 +2,8 @@
 
 # torchtitan
 
+For SenseNova-Loop-9B-Preview SFT, DPO and MTP, see the [standalone training guide](examples/train/SenseNova-Loop-9B-Preview/README.md).
+
 #### A PyTorch native platform for training generative AI models
 
 [![arXiv](https://img.shields.io/badge/arXiv-2410.06511-b31b1b.svg)](https://arxiv.org/abs/2410.06511)

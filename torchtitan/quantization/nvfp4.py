@@ -8,7 +8,7 @@
 
 Swaps dense ``Linear.Config`` nodes for :class:`NVFP4Linear`, which keeps a bf16
 weight and quantizes activations, weights, and gradients to NVFP4 on the fly via
-TorchAO's ``nvfp4_training`` kernels (NVIDIA sm100_family / sm_100+, CUDA only).
+TorchAO's ``nvfp4_training`` kernels (NVIDIA SM100 family / sm_100+, CUDA only).
 
 Like :class:`MXFP8LinearConverter`, this is a pure leaf swap: it inherits the
 model's stock colwise/rowwise sharding and changes only the GEMM. Under tensor

@@ -46,7 +46,11 @@ class ChunkedLossWrapperWithParamGrads(ChunkedLossWrapper):
             total_loss,
             lm_head,
             fsdp_enabled,
-            *lm_head.parameters(),
+            *(
+                parameter
+                for parameter in lm_head.parameters()
+                if parameter.requires_grad
+            ),
         )
 
 

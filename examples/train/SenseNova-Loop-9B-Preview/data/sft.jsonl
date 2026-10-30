@@ -1,0 +1,8 @@
+{"messages": [{"role": "user", "content": "What is 2 + 2?"}, {"role": "assistant", "content": "4."}]}
+{"messages": [{"role": "user", "content": "Name the largest planet."}, {"role": "assistant", "content": "Jupiter."}]}
+{"messages": [{"role": "user", "content": "Translate hello into Spanish."}, {"role": "assistant", "content": "Hola."}]}
+{"messages": [{"role": "user", "content": "Write one Python list."}, {"role": "assistant", "content": "[1, 2, 3]"}]}
+{"messages": [{"role": "user", "content": "What is the opposite of hot?"}, {"role": "assistant", "content": "Cold."}]}
+{"messages": [{"role": "user", "content": "How many sides does a triangle have?"}, {"role": "assistant", "content": "Three."}]}
+{"messages": [{"role": "user", "content": "Name a primary color."}, {"role": "assistant", "content": "Blue."}]}
+{"messages": [{"role": "user", "content": "Complete: one, two, ..."}, {"role": "assistant", "content": "three."}]}

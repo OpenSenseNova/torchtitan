@@ -82,7 +82,7 @@ def _bind_pp_forward_backward_body(trainer: TrainingEngine) -> None:
     )
 
 
-def _training_loop(trainer: TrainingEngine) -> SimpleNamespace:
+def _training_loop(trainer: TrainingEngine) -> Trainer:
     if not hasattr(trainer, "_num_optimizer_steps_since_cuda_graph_init"):
         trainer._num_optimizer_steps_since_cuda_graph_init = 0
     if not hasattr(trainer, "loss_is_finite"):
@@ -93,14 +93,16 @@ def _training_loop(trainer: TrainingEngine) -> SimpleNamespace:
         )
     if not hasattr(trainer, "optimizer_step"):
         trainer.optimizer_step = lambda: TrainingEngine.optimizer_step(trainer)
+    if not hasattr(trainer, "clip_grad_norm"):
+        trainer.clip_grad_norm = lambda: TrainingEngine.clip_grad_norm(trainer)
 
-    return SimpleNamespace(
-        engine=trainer,
-        config=trainer.config,
-        gradient_accumulation_steps=trainer.gradient_accumulation_steps,
-        num_pp_microbatches=trainer.num_pp_microbatches,
-        metrics_processor=trainer.metrics_processor,
-    )
+    loop = object.__new__(Trainer)
+    loop.engine = trainer
+    loop.config = trainer.config
+    loop.gradient_accumulation_steps = trainer.gradient_accumulation_steps
+    loop.num_pp_microbatches = trainer.num_pp_microbatches
+    loop.metrics_processor = trainer.metrics_processor
+    return loop
 
 
 def test_microbatch_generator_preserves_labels() -> None:
@@ -523,6 +525,7 @@ def test_training_engine_owns_cuda_graph_warmup() -> None:
         SimpleNamespace(
             config=SimpleNamespace(
                 sdc_replayer=None,
+                parallelism=SimpleNamespace(activation_reduce_dtype=None),
                 debug=SimpleNamespace(spmd_typechecking=False),
                 training=SimpleNamespace(disable_cuda_graphs=False),
             ),
@@ -581,6 +584,7 @@ def test_training_engine_skips_cuda_graph_warmup_when_unsupported() -> None:
         SimpleNamespace(
             config=SimpleNamespace(
                 sdc_replayer=None,
+                parallelism=SimpleNamespace(activation_reduce_dtype=None),
                 debug=SimpleNamespace(spmd_typechecking=False),
                 training=SimpleNamespace(disable_cuda_graphs=False),
             ),

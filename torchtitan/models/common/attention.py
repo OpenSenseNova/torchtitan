@@ -12,6 +12,7 @@
 #       the variable name xq/xk/xv disambiguates),
 #   K = query/key head dimension, V = value head dimension.
 
+import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, NamedTuple
@@ -19,30 +20,27 @@ from typing import Any, ClassVar, NamedTuple
 import spmd_types as spmd
 import torch
 import torch.nn.functional as F
-import torch_remat as remat
 from torch.distributed.tensor import DTensor, Replicate
-from torch.nn.attention import (
-    activate_flash_attention_impl,
-    current_flash_attention_impl,
-    sdpa_kernel,
-    SDPBackend,
-)
+from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.nn.attention.flex_attention import (
     _DEFAULT_SPARSE_BLOCK_SIZE,
     _mask_mod_signature,
     _score_mod_signature,
-    AuxRequest,
     BlockMask,
     create_block_mask,
-    flex_attention,
-)
-from torch.nn.attention.varlen import (
-    AuxRequest as VarlenAuxRequest,
-    varlen_attn as _varlen_attn,
 )
 
 from torchtitan.distributed.compile import maybe_regional_inductor
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
+from torchtitan.models.common.attention_compat import (
+    activate_flash_attention_impl,
+    AuxRequest,
+    current_flash_attention_impl,
+    flex_attention,
+    restore_flash_attention_impl,
+    varlen_attn as _varlen_attn,
+    VarlenAuxRequest,
+)
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
@@ -144,13 +142,22 @@ class VarlenInnerAttention(InnerAttention):
               - (W, 0): Sliding window causal - attend to at most W previous tokens.
         """
 
+        flash_attention_impl: str | None = None
+        """Explicit FA2/FA3/FA4 selection; None selects by GPU architecture."""
+
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.window_size = config.window_size
 
         from torchtitan.tools.utils import get_cuda_flash_attention_impl
 
-        flash_attention_impl = get_cuda_flash_attention_impl()
+        flash_attention_impl = (
+            config.flash_attention_impl or get_cuda_flash_attention_impl()
+        )
+        if flash_attention_impl == "FA2":
+            if current_flash_attention_impl() is not None:
+                restore_flash_attention_impl()
+            flash_attention_impl = None
         if (
             flash_attention_impl is not None
             and current_flash_attention_impl() != flash_attention_impl
@@ -192,10 +199,14 @@ class VarlenInnerAttention(InnerAttention):
         if (
             fa_impl in (None, "FA2") or is_in_batch_invariant_mode()
         ) and torch.version.hip is None:
-            varlen_kwargs["num_splits"] = 1
+            if "num_splits" in inspect.signature(_varlen_attn).parameters:
+                varlen_kwargs["num_splits"] = 1
 
         # Forward enable_gqa from GQAttention when Q and KV head counts differ
-        if kwargs.get("enable_gqa", False):
+        if (
+            kwargs.get("enable_gqa", False)
+            and "enable_gqa" in inspect.signature(_varlen_attn).parameters
+        ):
             varlen_kwargs["enable_gqa"] = True
 
         varlen_attn_fn = varlen_attn if out_transform is None else varlen_attn_with_lse
@@ -243,18 +254,24 @@ class FlexInnerAttention(InnerAttention):
         kernel_options: dict = field(default_factory=dict)
 
     inductor_configs: ClassVar[dict[str, bool]] = {
-        "wrap_inductor_compiled_regions": True,
+        **(
+            {"wrap_inductor_compiled_regions": True}
+            if hasattr(torch._inductor.config, "wrap_inductor_compiled_regions")
+            else {}
+        ),
         # Recommended workflow: run once with max_autotune=True to discover
         # good kernel_options, then set kernel_options explicitly in the config
         # and keep max_autotune disabled for faster compilation.
-        "max_autotune": True,
+        # MACA max-autotune miscomputes large masked vision attention.
+        # The default kernels pass forward/backward reference checks.
+        "max_autotune": not bool(getattr(torch.version, "maca", None)),
         # When enabled, after max_autotune selects the best kernel config,
         # coordinate descent iteratively tunes individual parameters (block
         # sizes, num_warps, num_stages) one at a time -- doubling/halving each
         # and accepting changes that improve runtime by >0.1%. This can also
         # run without max_autotune but starts from a weaker baseline config.
         # See torch/_inductor/runtime/coordinate_descent_tuner.py.
-        "coordinate_descent_tuning": True,
+        "coordinate_descent_tuning": not bool(getattr(torch.version, "maca", None)),
         "triton.cudagraphs": False,
     }
 
@@ -588,10 +605,18 @@ def get_sliding_window_mask_mod(window_size: int) -> _mask_mod_signature:
 
 
 _compiled_create_block_mask = torch.compile(create_block_mask)
+_supports_separate_full_blocks = (
+    "separate_full_blocks" in inspect.signature(create_block_mask).parameters
+)
 
 
 def create_attention_mask(*args, **kwargs):
     """Create an attention mask using compiled create_block_mask."""
+    if not _supports_separate_full_blocks:
+        if not kwargs.pop("separate_full_blocks", True):
+            raise NotImplementedError(
+                "This PyTorch version cannot disable full-block separation"
+            )
     return _compiled_create_block_mask(*args, **kwargs)
 
 
@@ -908,6 +933,8 @@ class GQAttention(BaseAttention):
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        import torch_remat as remat
+
         xq_THK, xk_THK, xv_THV = remat.region(
             self.qkv_linear,
             self.remat_region_name("qkv"),

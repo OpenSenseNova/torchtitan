@@ -3,25 +3,26 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+from __future__ import annotations
+
 import copy
 import dataclasses
 import logging
 import math
 import os
 from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from torch.distributed._mesh_layout import _MeshLayout
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.pipelining import PipelineStage
+from torch.distributed.pipelining import PipelineStage, schedules as pipeline_schedules
 from torch.distributed.pipelining.schedules import (
     _PipelineSchedule,
     _PipelineScheduleRuntime,
     get_schedule_class,
     PipelineScheduleMulti,
     PipelineScheduleSingle,
-    ScheduleDualPipeV,
     ScheduleZBVZeroBubble,
 )
 
@@ -35,6 +36,9 @@ from torchtitan.protocols.module import ModuleDict, ModuleList
 
 # These are the public entrypoints for model-specific PP setup. Helpers in this
 # module are implementation details and stay private.
+if TYPE_CHECKING:
+    from torch.distributed._mesh_layout import _MeshLayout
+
 logger = logging.getLogger(__name__)
 
 
@@ -552,7 +556,13 @@ def _get_pp_rank_to_stage_indices_mapping(
     """
     schedule_class = get_schedule_class(pp_schedule)
     style = (
-        "v" if schedule_class in (ScheduleZBVZeroBubble, ScheduleDualPipeV) else "loop"
+        "v"
+        if schedule_class
+        in (
+            ScheduleZBVZeroBubble,
+            getattr(pipeline_schedules, "ScheduleDualPipeV", None),
+        )
+        else "loop"
     )
     assert (
         num_stages % pp_degree == 0

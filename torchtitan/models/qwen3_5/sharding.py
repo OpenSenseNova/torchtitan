@@ -77,7 +77,11 @@ def annotate_deltanet_cu_seqlens(attention_masks: "Qwen35AttentionMaskDict") -> 
         return
     spmd.assert_type(
         deltanet_metadata.cu_seq_q,
-        {MeshAxisName.DP: spmd.V, MeshAxisName.TP: spmd.R},
+        {
+            MeshAxisName.DP: spmd.V,
+            MeshAxisName.CP: spmd.R,
+            MeshAxisName.TP: spmd.R,
+        },
     )
 
 
@@ -151,7 +155,7 @@ def set_qwen35_sharding_config(
             in_dst_shardings={"x_TD": layer_input_layout},
             out_src_shardings=layer_input_layout,
         )
-        _set_qwen35_layer_sharding(
+        set_qwen35_layer_sharding(
             layer_cfg,
             attention_input_layout=layer_input_layout,
             enable_sp=enable_sp,
@@ -159,13 +163,14 @@ def set_qwen35_sharding_config(
         )
 
 
-def _set_qwen35_layer_sharding(
+def set_qwen35_layer_sharding(
     layer_cfg: "Qwen35TransformerBlock.Config",
     *,
     attention_input_layout: SpmdType,
     enable_sp: bool,
     enable_ep: bool,
 ) -> None:
+    """Configure one Qwen layer without changing the main layer container."""
     layer_cfg.attention_norm.sharding_config = _decoder_norm_sharding(
         attention_input_layout
     )

@@ -100,7 +100,7 @@ def get_attention_config(
 
         if not has_cuda_capability(9, 0):
             raise ValueError(
-                "Flash backend of FlexInnerAttention is only supported on Hopper or sm100_family"
+                "Flash backend of FlexInnerAttention is only supported on Hopper or SM100 family"
             )
         return FlexInnerAttention.Config(
             block_size=(256, 128), kernel_options={"BACKEND": "FLASH"}

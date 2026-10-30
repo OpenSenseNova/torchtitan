@@ -34,7 +34,7 @@ MXFP8 training can provide substantial training speedups for models where the ma
 MXFP8 differs from standard Float8 training in its scaling approach:
 
 - **Granular scaling factor**: Instead of using a single scale factor per tensor (tensorwise) or per row/column (rowwise), MXFP8 uses a more granular, block-based scaling with a default block size of 1x32 elements. Each block of 32 elements shares a common scale factor. The data dtype is `torch.float8_e4m3fn`, and the scale factor dtype is `torch.float8_e8mfnu`.
-- **Native hardware support**: On NVIDIA SM100 (sm100_family) GPUs, MXFP8 GEMMs and Grouped GEMMs are accelerated using cuBLAS and CUTLASS kernels exposed via `torch.nn.functional.scaled_mm` and `torch._scaled_grouped_mm`, achieving up to 2x speedup over bfloat16 on common shapes.
+- **Native hardware support**: On NVIDIA SM100 (SM100 family) GPUs, MXFP8 GEMMs and Grouped GEMMs are accelerated using cuBLAS and CUTLASS kernels exposed via `torch.nn.functional.scaled_mm` and `torch._scaled_grouped_mm`, achieving up to 2x speedup over bfloat16 on common shapes.
 - **Dynamic activation quantization**: Linear and Grouped GEMM activations use
   standard 1x32 MXFP8 scaling and are dynamically quantized for each operation.
   Forward scales are computed independently within each token row, so scale

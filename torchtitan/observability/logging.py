@@ -17,15 +17,36 @@ import sys
 __all__ = ["init_logger", "warn_once"]
 
 
+class _RankFilter(logging.Filter):
+    def __init__(self):
+        super().__init__()
+        self.rank = int(os.environ.get("RANK", "0"))
+        selected = os.environ.get("LOG_RANK")
+        self.ranks = (
+            {int(rank) for rank in selected.split(",") if rank.strip()}
+            if selected is not None
+            else None
+        )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.rank = self.rank
+        return (
+            record.levelno >= logging.WARNING
+            or self.ranks is None
+            or self.rank in self.ranks
+        )
+
+
 def init_logger() -> None:
-    """Configure the process-wide root logger for TorchTitan applications."""
+    """Optionally select global INFO ranks with LOG_RANK; keep warnings/errors everywhere."""
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     root_logger.handlers.clear()
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
+    console_handler.addFilter(_RankFilter())
     formatter = logging.Formatter(
-        "[titan] %(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        "[titan][rank %(rank)d] %(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
     console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)

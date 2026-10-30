@@ -20,6 +20,7 @@ Shape suffixes:
 - Dh = head dim
 """
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -32,7 +33,12 @@ from torchtitan.models.common.attention import FlexInnerAttention, local_head_sp
 from torchtitan.models.common.nn_modules import GELU, LayerNorm, RMSNorm
 from torchtitan.protocols.module import Module
 
-compiled_create_block_mask = torch.compile(create_block_mask)
+# Opt in before process startup; keep the existing eager path by default.
+_vision_create_block_mask = (
+    torch.compile(create_block_mask)
+    if os.environ.get("VISION_BLOCKMASK_COMPILE", "0") == "1"
+    else create_block_mask
+)
 
 # Applies rotary position embedding: (query, key, rope_cache) -> (query, key).
 RopeApply = Callable[
@@ -57,7 +63,7 @@ def create_block_diagonal_mask(
     def mask_mod(b, h, q_idx, kv_idx):
         return segment_ids[q_idx] == segment_ids[kv_idx]
 
-    return compiled_create_block_mask(
+    return _vision_create_block_mask(
         mask_mod,
         1,
         None,

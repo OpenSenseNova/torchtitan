@@ -1,0 +1,8 @@
+{"messages": [{"role": "user", "content": "What is 2 + 2?"}, {"role": "assistant", "content": "4."}], "rejected_response": "5."}
+{"messages": [{"role": "user", "content": "Name the largest planet."}, {"role": "assistant", "content": "Jupiter."}], "rejected_response": "Mars."}
+{"messages": [{"role": "user", "content": "Translate hello into Spanish."}, {"role": "assistant", "content": "Hola."}], "rejected_response": "Merci."}
+{"messages": [{"role": "user", "content": "Write one Python list."}, {"role": "assistant", "content": "[1, 2, 3]"}], "rejected_response": "(1, 2, 3)"}
+{"messages": [{"role": "user", "content": "What is the opposite of hot?"}, {"role": "assistant", "content": "Cold."}], "rejected_response": "Warm."}
+{"messages": [{"role": "user", "content": "How many sides does a triangle have?"}, {"role": "assistant", "content": "Three."}], "rejected_response": "Four."}
+{"messages": [{"role": "user", "content": "Name a primary color."}, {"role": "assistant", "content": "Blue."}], "rejected_response": "Green."}
+{"messages": [{"role": "user", "content": "Complete: one, two, ..."}, {"role": "assistant", "content": "three."}], "rejected_response": "five."}

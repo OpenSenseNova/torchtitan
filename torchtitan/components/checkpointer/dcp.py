@@ -19,15 +19,7 @@ from typing import Any, cast, Literal, TYPE_CHECKING
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint import HuggingFaceStorageWriter
-from torch.distributed.checkpoint._consolidate_hf_safetensors import (
-    consolidate_safetensors_files_on_every_rank,
-)
-from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
-from torch.distributed.checkpoint.state_dict_saver import (
-    AsyncCheckpointerType,
-    AsyncSaveResponse,
-)
+from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools import filesystem
@@ -48,6 +40,8 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import torch.nn as nn
+    from torch.distributed.checkpoint.staging import DefaultStager
+    from torch.distributed.checkpoint.state_dict_saver import AsyncSaveResponse
 
     from torchtitan.components.data.loader import BaseDataLoader
     from torchtitan.components.optimizer import (
@@ -284,6 +278,8 @@ class CheckpointManager(BaseCheckpointManager):
 
         # HF Format Conversion
         if to_hf:
+            from torch.distributed.checkpoint import HuggingFaceStorageWriter
+
             assert self.sd_adapter is not None, "sd_adapter is required for to_hf=True"
             state_dict = self.sd_adapter.to_hf(state_dict)
             fqn_to_index_mapping = self.sd_adapter.fqn_to_index_mapping
@@ -338,6 +334,10 @@ class CheckpointManager(BaseCheckpointManager):
 
         # Post-Processing
         if to_hf and fqn_to_index_mapping:
+            from torch.distributed.checkpoint._consolidate_hf_safetensors import (
+                consolidate_safetensors_files_on_every_rank,
+            )
+
             consolidate_safetensors_files_on_every_rank(
                 input_dir=os.path.join(checkpoint_id, "sharded"),
                 output_dir=checkpoint_id,
@@ -446,6 +446,12 @@ class CheckpointManager(BaseCheckpointManager):
         async_save_started_at: float | None = None
 
         if self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
+            from torch.distributed.checkpoint.staging import (
+                DefaultStager,
+                StagingOptions,
+            )
+            from torch.distributed.checkpoint.state_dict_saver import AsyncSaveResponse
+
             GarbageCollection.collect("GC collection invoked by checkpointer.")
             if self.stager is None:
                 self.stager = DefaultStager(

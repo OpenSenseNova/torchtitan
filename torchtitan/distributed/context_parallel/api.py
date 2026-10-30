@@ -10,11 +10,7 @@ import spmd_types as spmd
 import torch
 from spmd_types import SpmdType
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor.experimental._attention import (
-    _context_parallel_shard,
-    _HeadTailLoadBalancer,
-    _PTRRLoadBalancer,
-)
+from torch.distributed.tensor.experimental import _attention as torch_cp_attention
 from torch.nn.attention.flex_attention import BlockMask
 
 from torchtitan.distributed.parallel_dims import MeshAxisName
@@ -161,6 +157,30 @@ def cp_shard(
         seq_dims = tuple(input_seq_dims for _ in inputs)
     seq_len = inputs[0].size(seq_dims[0])
     cp_world_size = cp_mesh.size(0)
+
+    if not hasattr(torch_cp_attention, "_context_parallel_shard"):
+        # Ulysses uses contiguous sequence shards and balances attention by heads.
+        # PyTorch 2.8 does not provide the newer mask/load-balancer API.
+        if load_balancer_type is not None or attention_masks is not None:
+            raise NotImplementedError(
+                "This PyTorch build supports contiguous CP inputs without BlockMask only"
+            )
+        rank = cp_mesh.get_local_rank()
+        shards = []
+        for tensor, dim in zip(inputs, seq_dims, strict=True):
+            if tensor.size(dim) % cp_world_size:
+                raise ValueError(
+                    "CP input sequence length must divide the CP world size"
+                )
+            size = tensor.size(dim) // cp_world_size
+            shards.append(tensor.narrow(dim, rank * size, size).contiguous())
+        return tuple(shards), None
+
+    from torch.distributed.tensor.experimental._attention import (
+        _context_parallel_shard,
+        _HeadTailLoadBalancer,
+        _PTRRLoadBalancer,
+    )
 
     load_balancer = None
     if load_balancer_type:

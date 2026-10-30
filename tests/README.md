@@ -227,3 +227,7 @@ To run a specific test function:
 ```bash
 pytest -s tests/unit_tests/cpu/test_config_manager.py::TestConfigManager::test_cli_overrides
 ```
+
+The SM100/SM103 integration workflow uses the repository variable
+ACCELERATOR_TEST_RUNNER as its runner label. Configure it for an eight-GPU
+CUDA runner before enabling this lane; the job is skipped when it is unset.

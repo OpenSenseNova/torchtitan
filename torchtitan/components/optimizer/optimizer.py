@@ -439,9 +439,8 @@ def register_moe_load_balancing_hook(
         model_parts: list[nn.Module],
     ) -> Iterator[tuple[nn.Module, _MoELike]]:
         for model_part in model_parts:
-            # MTP decoder blocks live in ``mtp_layers`` after FSDP wrapping;
-            # they are only temporarily inserted into ``layers`` while FSDP
-            # is applied. Keep both containers in the runtime hook so MTP
+            # MTP decoder blocks remain in their own container during FSDP
+            # wrapping. Keep both containers in the runtime hook so MTP
             # expert bias and usage counters receive the same update as the
             # main decoder layers.
             layer_containers = [model_part.get_submodule("layers")]

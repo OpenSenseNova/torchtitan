@@ -1,0 +1,14 @@
+{
+  "start": 0,
+  "end": 4,
+  "counts": [
+    2
+  ],
+  "probabilities": [
+    1.0
+  ],
+  "eval_count": 2,
+  "gate_init": 0.02,
+  "seed": 42,
+  "use_gate": false
+}

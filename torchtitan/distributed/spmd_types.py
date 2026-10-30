@@ -44,6 +44,8 @@ __all__ = [
     "spmd_mesh_size",
     "spmd_distribute_tensor",
     "spmd_redistribute_per_axis",
+    "spmd_redistribute",
+    "spmd_reduction_dtype",
     "spmd_validate_redistributions",
     "set_current_spmd_mesh",
     "set_spmd_meshes",
@@ -51,6 +53,50 @@ __all__ = [
 
 
 _MESH_TLS = local()
+
+
+@spmd.register_local_backward_hook
+def _contiguous_collective_gradient(grad: torch.Tensor) -> torch.Tensor:
+    # spmd_types 0.2.5 does not make reduce-scatter inputs contiguous. A sum
+    # can supply an expanded, zero-stride gradient; casting only fixes this
+    # accidentally when op_dtype differs. Preserve values and dtype here.
+    return grad.contiguous()
+
+
+@contextlib.contextmanager
+def spmd_reduction_dtype(dtype: torch.dtype | None) -> Iterator[None]:
+    """Set activation reduction precision for a forward/backward region."""
+    if dtype not in (None, torch.float32):
+        raise ValueError("Activation reductions require float32 or None")
+    previous = getattr(_MESH_TLS, "reduction_dtype", None)
+    _MESH_TLS.reduction_dtype = dtype
+    try:
+        yield
+    finally:
+        _MESH_TLS.reduction_dtype = previous
+
+
+def spmd_redistribute(x: torch.Tensor, axis, *, src, dst, **kwargs) -> torch.Tensor:
+    """Apply the scoped precision policy only to additive collectives.
+
+    P in forward requires a sum. R in forward has P as its adjoint, so its
+    backward requires a sum. Cast once after summation, preserving the tensor
+    dtype and autograd contract; pure gathers and all-to-all need no upcast.
+    """
+    dtype = getattr(_MESH_TLS, "reduction_dtype", None)
+    if dtype is not None and x.dtype in (torch.float16, torch.bfloat16):
+        if src is spmd.P:
+            kwargs.update(op_dtype=dtype, out_dtype=x.dtype)
+        if dst is spmd.R:
+            kwargs["backward_options"] = {
+                **(kwargs.get("backward_options") or {}),
+                "op_dtype": dtype,
+                "out_dtype": x.dtype,
+            }
+    result = spmd.redistribute(x, axis, src=src, dst=dst, **kwargs)
+    if dst is spmd.R and result.requires_grad:
+        result.register_hook(_contiguous_collective_gradient)
+    return result
 
 
 def spmd_axes(layout: spmd.SpmdType) -> tuple[MeshAxisName, ...]:
@@ -467,7 +513,7 @@ def spmd_redistribute_per_axis(
         )
         if src_t == dst_t or axis_size == 1:
             continue
-        x = spmd.redistribute(
+        x = spmd_redistribute(
             x,
             mesh.get_group(axis),
             src=src_t,

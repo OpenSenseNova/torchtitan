@@ -109,10 +109,10 @@ def build_device_memory_monitor():
 
 def compute_training_performance_metrics(
     *,
-    num_tokens: int,
+    num_tokens: float,
     elapsed_time: float,
     non_data_parallel_size: int,
-    num_flops_per_token: int,
+    num_flops_per_token: float,
     gpu_peak_flops: float,
     has_quantization: bool,
 ) -> dict[str, float]:
@@ -123,7 +123,7 @@ def compute_training_performance_metrics(
         "tokens_per_second": tokens_per_second,
         "tflops": tflops,
     }
-    if not has_quantization:
+    if not has_quantization and gpu_peak_flops > 0:
         metrics["mfu_percent"] = (
             100 * num_flops_per_token * tokens_per_second / gpu_peak_flops
         )
@@ -488,6 +488,33 @@ class MetricsProcessor(Configurable):
             logger.debug("No loggers enabled, returning an empty LoggerContainer")
         return logger_container
 
+    def get_interval_metrics(self) -> tuple[float, dict[str, float]]:
+        """Estimate interval performance; called on every rank before logging.
+
+        Model-specific processors can override this for packed or dynamic work.
+        Keep any distributed aggregation here, independent of console filtering.
+        """
+        time_delta = time.perf_counter() - self.time_last_log
+        performance = compute_training_performance_metrics(
+            num_tokens=self.ntokens_since_last_log,
+            elapsed_time=time_delta,
+            non_data_parallel_size=self.parallel_dims.non_data_parallel_size,
+            num_flops_per_token=self.num_flops_per_token,
+            gpu_peak_flops=self.gpu_peak_flops,
+            has_quantization=self.has_quantization,
+        )
+        metrics = {
+            "throughput(TGS)": performance["tokens_per_second"],
+            "tflops": performance["tflops"],
+        }
+        if "mfu_percent" in performance:
+            metrics["mfu(%)"] = performance["mfu_percent"]
+        return time_delta, metrics
+
+    def format_throughput(self, metrics: dict[str, Any]) -> str:
+        """Format per-GPU throughput; subclasses may add valid-token metrics."""
+        return f"TGS: {metrics['throughput(TGS)']:,.1f} (tokens/s/GPU)"
+
     def log(
         self,
         step: int,
@@ -511,19 +538,9 @@ class MetricsProcessor(Configurable):
         """
         assert self.num_flops_per_token > 0, "num_flops_per_token must be set"
 
-        time_delta = time.perf_counter() - self.time_last_log
-
-        performance = compute_training_performance_metrics(
-            num_tokens=self.ntokens_since_last_log,
-            elapsed_time=time_delta,
-            non_data_parallel_size=self.parallel_dims.non_data_parallel_size,
-            num_flops_per_token=self.num_flops_per_token,
-            gpu_peak_flops=self.gpu_peak_flops,
-            has_quantization=self.has_quantization,
-        )
-        tps = performance["tokens_per_second"]
+        time_delta, performance = self.get_interval_metrics()
         tflops = performance["tflops"]
-        mfu = performance.get("mfu_percent")
+        mfu = performance.get("mfu(%)")
 
         assert self.step_last_log is not None
         time_end_to_end = time_delta / (step - self.step_last_log)
@@ -536,9 +553,10 @@ class MetricsProcessor(Configurable):
             "loss_metrics/global_avg_loss": global_avg_loss,
             "loss_metrics/global_max_loss": global_max_loss,
             "grad_norm": grad_norm,
-            "throughput(tps)": tps,
-            "tflops": tflops,
+            **performance,
             "time_metrics/end_to_end(s)": time_end_to_end,
+            "time_metrics/interval(s)": time_delta,
+            "time_metrics/interval_steps": step - self.step_last_log,
             "time_metrics/data_loading(s)": time_data_loading,
             "time_metrics/data_loading(%)": time_data_loading_pct,
             "memory/max_active(GiB)": device_mem_stats.max_active_gib,
@@ -548,13 +566,12 @@ class MetricsProcessor(Configurable):
             "memory/num_alloc_retries": device_mem_stats.num_alloc_retries,
             "memory/num_ooms": device_mem_stats.num_ooms,
         }
-        if mfu is not None:
-            metrics["mfu(%)"] = mfu
-
         if extra_metrics:
             metrics.update(extra_metrics)
 
         self.logger.log(metrics, step)
+        self.last_metrics = metrics
+        self.last_metrics_step = step
 
         color = self.color
         mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
@@ -564,9 +581,10 @@ class MetricsProcessor(Configurable):
             f"{color.orange}grad_norm: {grad_norm:7.4f}  "
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
-            f"{color.blue}tps: {round(tps):,}  "
+            f"{color.blue}{self.format_throughput(metrics)}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
-            f"{color.magenta}mfu: {mfu_str}{color.reset}"
+            f"{color.magenta}mfu: {mfu_str}{color.reset}  "
+            f"step_time: {time_end_to_end:.3f}s"
         )
 
         self.ntokens_since_last_log = 0
@@ -582,14 +600,14 @@ class MetricsProcessor(Configurable):
 
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
-        # tokens per second per device, abbreviated as tps
-        tps = self.ntokens_since_last_log / (
+        # Tokens per second per GPU.
+        tgs = self.ntokens_since_last_log / (
             time_delta * self.parallel_dims.non_data_parallel_size
         )
 
         metrics = {
             "validation_metrics/loss": loss,
-            "validation_metrics/throughput(tps)": tps,
+            "validation_metrics/throughput(TGS)": tgs,
             "validation_metrics/memory/max_active(GiB)": device_mem_stats.max_active_gib,
             "validation_metrics/memory/max_active(%)": device_mem_stats.max_active_pct,
             "validation_metrics/memory/max_reserved(GiB)": device_mem_stats.max_reserved_gib,
@@ -607,7 +625,7 @@ class MetricsProcessor(Configurable):
             f"{color.green}loss: {loss:7.4f}  "
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
-            f"{color.blue}tps: {round(tps):,}{color.reset}"
+            f"{color.blue}TGS: {tgs:,.1f} (tokens/s/GPU){color.reset}"
         )
 
         self.ntokens_since_last_log = 0

@@ -7,6 +7,7 @@
 import contextlib
 import gc
 import logging
+import math
 import os
 import subprocess
 import time
@@ -149,22 +150,31 @@ class GarbageCollection:
         logger.info("[GC] %s took %.2f seconds", reason, time.monotonic() - begin)
 
 
-# hardcoded BF16 type peak flops for NVIDIA A100, H20, H100, H200, SM100 GPU,
+# Dense BF16 peak FLOPS for known accelerator models,
 # AMD MI250, MI300X, MI325X, MI350X, MI355X, Intel PVC, and AWS Trainium/Inferentia
 def get_peak_flops(device_name: str) -> float:
-    try:
-        # Run the lspci command and capture the output
-        result = subprocess.run(["lspci"], stdout=subprocess.PIPE, text=True)
-        # Filter the output for lines containing both "NVIDIA" and "H100"
-        filtered_lines = [
-            line
-            for line in result.stdout.splitlines()
-            if "NVIDIA" in line and "H100" in line
-        ]
-        # Join all filtered lines into a single string
-        device_name = " ".join(filtered_lines) or device_name
-    except FileNotFoundError as e:
-        logger.warning(f"Error running lspci: {e}, fallback to use device_name")
+    """Return a dense BF16 peak, or zero when MFU cannot be determined."""
+    configured = os.environ.get("GPU_PEAK_FLOPS")
+    if configured is not None:
+        peak = float(configured)
+        if not math.isfinite(peak) or peak <= 0:
+            raise ValueError("GPU_PEAK_FLOPS must be a positive finite FLOP/s value")
+        return peak
+    # Only H100 variants need PCI identification beyond the CUDA device name.
+    if "H100" in device_name:
+        try:
+            # Run the lspci command and capture the output
+            result = subprocess.run(["lspci"], stdout=subprocess.PIPE, text=True)
+            # Filter the output for lines containing both "NVIDIA" and "H100"
+            filtered_lines = [
+                line
+                for line in result.stdout.splitlines()
+                if "NVIDIA" in line and "H100" in line
+            ]
+            # Join all filtered lines into a single string
+            device_name = " ".join(filtered_lines) or device_name
+        except FileNotFoundError as e:
+            logger.warning(f"Error running lspci: {e}, fallback to use device_name")
     if "A100" in device_name:
         # data from https://www.nvidia.com/en-us/data-center/a100/
         return 312e12
@@ -194,16 +204,6 @@ def get_peak_flops(device_name: str) -> float:
         # Ref: https://www.tomshardware.com/news/
         # nvidias-latest-regulation-compliant-gpu-for-china-has-been-delayed-to-early-next-year
         return 148e12
-    elif "SM100_NVLINK" in device_name or "SM103_NVLINK" in device_name:
-        # Grace sm100_family Superchips (Grace CPU + sm100_family GPU)
-        # BF16 dense per GPU: 2,500 TFLOPS (half of 5,000 TFLOPS with sparsity)
-        # SM100_NVLINK data from 
-        # SM103_NVLINK data from 
-        return 2.5e15
-    elif "SM103" in device_name or "SM100" in device_name:
-        # data from 
-        # Checked after SM103_NVLINK to avoid false match on "SM103_NVLINK"
-        return 2.25e15
     elif "MI350X" in device_name:
         # MI350X data from https://www.amd.com/en/products/accelerators/instinct/mi350/mi350x.html
         return 2300e12
@@ -270,9 +270,11 @@ def get_peak_flops(device_name: str) -> float:
             )
             return 312e12
 
-    else:  # for other GPU types, assume A100
-        logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")
-        return 312e12
+    else:
+        logger.warning(
+            "Peak FLOPS is unknown; MFU is omitted. Set GPU_PEAK_FLOPS to report it."
+        )
+        return 0.0
 
 
 @dataclass(frozen=True)

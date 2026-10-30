@@ -16,13 +16,15 @@ from dataclasses import dataclass
 import spmd_types as spmd
 import torch
 import torch.nn.functional as F
-from attn_gym.linear import causal_conv1d, chunk_gdn, l2norm, recurrent_gdn
 from torch import nn
 
+from torchtitan.distributed.parallel_dims import MeshAxisName
+from torchtitan.distributed.spmd_types import spmd_mesh_group
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.models.common import Conv1d, Linear
 from torchtitan.models.common.attention import VarlenMetadata
 from torchtitan.protocols.module import Module
+from .gdn_kernels import causal_conv1d, chunk_gdn, l2norm, recurrent_gdn
 
 
 @spmd.local_map(
@@ -294,6 +296,35 @@ class InnerGatedDeltaNet(Module):
         value_head_dim: int,
     ) -> torch.Tensor:
         """Run separate Q/K/V convolutions and recurrence on local heads."""
+        inputs = (query_TC, key_TC, value_TC, a_TH, b_TH)
+        return self._forward_inputs(
+            inputs.__getitem__,
+            conv_q_weight_C1W,
+            conv_k_weight_C1W,
+            conv_v_weight_C1W,
+            A_log_H,
+            dt_bias_H,
+            cu_seqlens,
+            key_head_dim=key_head_dim,
+            value_head_dim=value_head_dim,
+        )
+
+    def _forward_inputs(
+        self,
+        get_input,
+        conv_q_weight_C1W,
+        conv_k_weight_C1W,
+        conv_v_weight_C1W,
+        A_log_H,
+        dt_bias_H,
+        cu_seqlens,
+        *,
+        key_head_dim: int,
+        value_head_dim: int,
+    ) -> torch.Tensor:
+        # Consume each input just before its first operation so CP exchanges
+        # for later inputs can overlap the current convolution.
+        query_TC = get_input(0)
         num_tokens = query_TC.shape[0]
         use_varlen_kernels = cu_seqlens.numel() > 2 or is_in_batch_invariant_mode()
 
@@ -328,14 +359,16 @@ class InnerGatedDeltaNet(Module):
         xq_THK = causal_conv(query_TC, conv_q_weight_C1W).reshape(
             num_tokens, -1, key_head_dim
         )
-        xk_THK = causal_conv(key_TC, conv_k_weight_C1W).reshape(
+        xk_THK = causal_conv(get_input(1), conv_k_weight_C1W).reshape(
             num_tokens, -1, key_head_dim
         )
-        xv_THV = causal_conv(value_TC, conv_v_weight_C1W).reshape(
+        xv_THV = causal_conv(get_input(2), conv_v_weight_C1W).reshape(
             num_tokens, -1, value_head_dim
         )
-        g_TH = -torch.exp(A_log_H.float()) * F.softplus(a_TH.float() + dt_bias_H)
-        beta_TH = torch.sigmoid(b_TH)
+        g_TH = -torch.exp(A_log_H.float()) * F.softplus(
+            get_input(3).float() + dt_bias_H
+        )
+        beta_TH = torch.sigmoid(get_input(4))
         return self.kernel(
             xq_THK,
             xk_THK,
@@ -344,6 +377,120 @@ class InnerGatedDeltaNet(Module):
             beta_TH,
             cu_seqlens=cu_seqlens if use_varlen_kernels else None,
         )
+
+
+class AllToAllCPInnerGatedDeltaNet(InnerGatedDeltaNet):
+    """Exchange token shards for head shards around convolution and recurrence.
+
+    Parameters remain CP-replicated for the outer FSDP reduction. Selecting
+    their local head ranges produces zero gradients for other ranges, so that
+    FSDP sums each head's gradient exactly once. The inverse activation exchange
+    restores token shards before gated norm and the output projection.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(InnerGatedDeltaNet.Config):
+        cp_overlap: bool = False
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.cp_overlap = config.cp_overlap
+
+    def forward(
+        self,
+        query_TC: torch.Tensor,
+        key_TC: torch.Tensor,
+        value_TC: torch.Tensor,
+        a_TH: torch.Tensor,
+        b_TH: torch.Tensor,
+        conv_q_weight_C1W: torch.Tensor,
+        conv_k_weight_C1W: torch.Tensor,
+        conv_v_weight_C1W: torch.Tensor,
+        A_log_H: torch.Tensor,
+        dt_bias_H: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        *,
+        key_head_dim: int,
+        value_head_dim: int,
+    ) -> torch.Tensor:
+        cp_group = spmd_mesh_group(MeshAxisName.CP)
+        if cp_group is None:
+            raise RuntimeError(
+                "All-to-all GDN requires an active multi-rank CP mesh axis"
+            )
+        cp_size, cp_rank = cp_group.size(), cp_group.rank()
+        num_key_heads = query_TC.shape[1] // key_head_dim
+        num_value_heads = value_TC.shape[1] // value_head_dim
+        if num_key_heads % cp_size or num_value_heads % cp_size:
+            raise ValueError(
+                f"GDN all-to-all CP ({cp_size}) must divide the TP-local "
+                f"key heads ({num_key_heads}) and value heads ({num_value_heads})"
+            )
+
+        def exchange(x_TC: torch.Tensor, head_dim: int) -> torch.Tensor:
+            x_THK = x_TC.reshape(x_TC.shape[0], -1, head_dim)
+            x_THK = spmd.redistribute(x_THK, cp_group, src=spmd.S(0), dst=spmd.S(1))
+            return x_THK.flatten(1)
+
+        if self.cp_overlap:
+            from torchtitan.distributed.cp_stream import redistribute_on_cp_stream
+
+            inputs = (query_TC, key_TC, value_TC, a_TH, b_TH)
+            head_dims = (key_head_dim, key_head_dim, value_head_dim, 1, 1)
+
+            def schedule(index):
+                tensor = inputs[index]
+                return redistribute_on_cp_stream(
+                    tensor.reshape(tensor.shape[0], -1, head_dims[index]),
+                    cp_group,
+                    src=spmd.S(0),
+                    dst=spmd.S(1),
+                )
+
+            pending = [schedule(0)]
+
+            def consume(index):
+                # Queue the next exchange before consuming this input. Avoid
+                # delaying Q's convolution with CPU dispatch for every input.
+                if index + 1 < len(inputs):
+                    pending.append(schedule(index + 1))
+                return pending[index].wait().flatten(1)
+
+            output_THV = self._forward_inputs(
+                consume,
+                conv_q_weight_C1W.chunk(cp_size, dim=0)[cp_rank],
+                conv_k_weight_C1W.chunk(cp_size, dim=0)[cp_rank],
+                conv_v_weight_C1W.chunk(cp_size, dim=0)[cp_rank],
+                A_log_H.chunk(cp_size, dim=0)[cp_rank],
+                dt_bias_H.chunk(cp_size, dim=0)[cp_rank],
+                cu_seqlens,
+                key_head_dim=key_head_dim,
+                value_head_dim=value_head_dim,
+            )
+            return spmd.redistribute(output_THV, cp_group, src=spmd.S(1), dst=spmd.S(0))
+
+        # Keep complete heads together, including each Q/K head's value group.
+        query_TC = exchange(query_TC, key_head_dim)
+        key_TC = exchange(key_TC, key_head_dim)
+        value_TC = exchange(value_TC, value_head_dim)
+        a_TH = exchange(a_TH, 1)
+        b_TH = exchange(b_TH, 1)
+        output_THV = super().forward(
+            query_TC,
+            key_TC,
+            value_TC,
+            a_TH,
+            b_TH,
+            conv_q_weight_C1W.chunk(cp_size, dim=0)[cp_rank],
+            conv_k_weight_C1W.chunk(cp_size, dim=0)[cp_rank],
+            conv_v_weight_C1W.chunk(cp_size, dim=0)[cp_rank],
+            A_log_H.chunk(cp_size, dim=0)[cp_rank],
+            dt_bias_H.chunk(cp_size, dim=0)[cp_rank],
+            cu_seqlens,
+            key_head_dim=key_head_dim,
+            value_head_dim=value_head_dim,
+        )
+        return spmd.redistribute(output_THV, cp_group, src=spmd.S(1), dst=spmd.S(0))
 
 
 class GatedDeltaNet(Module):

@@ -88,6 +88,30 @@ def _chunked_loss_and_grads(model, chunked_loss, hidden_states, labels, gvt):
 
 
 class TestChunkedLossWrapperWithParamGrads(TestCase):
+    def test_mixed_outputs_with_frozen_head(self):
+        torch.manual_seed(42)
+        head = nn.Linear(4, 8, bias=False).requires_grad_(False)
+        wrapper = ChunkedLossWrapperWithParamGrads(
+            ChunkedLossWrapperWithParamGrads.Config(
+                num_chunks=2, loss_fn=_WeightedTwoOutputLoss.Config()
+            )
+        )
+        wrapper.set_lm_head(head)
+        main = torch.randn(8, 4)
+        auxiliary = torch.randn(8, 4, requires_grad=True)
+        reference = auxiliary.detach().clone().requires_grad_(True)
+        labels = tuple(torch.randint(0, 8, (8,)) for _ in range(2))
+        expected = cross_entropy_loss(
+            head(main), labels[0]
+        ) + 0.25 * cross_entropy_loss(head(reference), labels[1])
+        (expected_gradient,) = torch.autograd.grad(expected, reference)
+        actual, _ = wrapper((main, auxiliary), labels)
+        (actual_gradient,) = torch.autograd.grad(actual, auxiliary)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_gradient, expected_gradient)
+        self.assertIsNone(main.grad)
+        self.assertIsNone(head.weight.grad)
+
     def test_config_builds_param_grads_loss(self):
         loss = ChunkedLossWrapperWithParamGrads.Config(num_chunks=4).build()
         self.assertIsInstance(loss, ChunkedLossWrapperWithParamGrads)

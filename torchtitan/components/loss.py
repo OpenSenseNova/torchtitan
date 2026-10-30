@@ -514,8 +514,8 @@ class ChunkedLossWrapper(BaseLoss):
     The inner ``loss_fn`` defaults to ``CrossEntropyLoss`` and is called once per
     chunk on logits from that chunk. ``pred`` and ``labels`` may be aligned
     tuples; their tensor or tuple structure is preserved when calling the inner
-    loss. Additional per-token ``loss_inputs`` are chunked along the same
-    sequence dimension and forwarded to the inner loss.
+    loss. Per-token ``loss_inputs`` are chunked along the same sequence
+    dimension; scalar tensors (such as step denominators) pass through.
 
     The flow:
     1. Model forward with _skip_lm_head=True to get one or more hidden states [T, D]
@@ -530,8 +530,9 @@ class ChunkedLossWrapper(BaseLoss):
         The lm_head's FSDP reshard-after-forward and reshard-after-backward are
         temporarily disabled during the chunked loop so that the weight stays
         unsharded across all outputs and chunks (avoiding repeated all-gathers).
-        Gradient synchronization remains disabled until the final chunk, so one
-        reduce-scatter processes the accumulated lm_head parameter gradients.
+        Gradient synchronization remains disabled until the final chunk, which
+        restores the caller's reduce-scatter and all-reduce settings. This
+        preserves gradient accumulation across microbatches.
 
     TP / SP composability:
         The root decoder norm emits hidden states that are replicated on the
@@ -610,18 +611,18 @@ class ChunkedLossWrapper(BaseLoss):
                 "ChunkedLossWrapper requires either one prediction/labels "
                 "tensor pair or non-empty aligned tuples."
             )
-        requires_grad = pred[0].requires_grad
-        if any(prediction.requires_grad != requires_grad for prediction in pred[1:]):
-            raise ValueError(
-                "All chunked-loss predictions must agree on whether gradients "
-                "are required."
-            )
+        requires_grads = tuple(prediction.requires_grad for prediction in pred)
+        requires_grad = any(requires_grads)
 
         # Chunking operates on the local tensor. Equal chunk sizes match
         # GradAccumulator's sequential slice
         # writes, which use one chunk length for each write offset.
         def _chunk_local(t):
             seq_len = t.shape[0]
+            torch._check(
+                seq_len == pred[0].shape[0],
+                lambda: "ChunkedLossWrapper token tensors must have the same sequence length",
+            )
             torch._check(
                 seq_len % num_chunks == 0,
                 lambda: "ChunkedLossWrapper sequence length must be divisible by num_chunks",
@@ -636,27 +637,30 @@ class ChunkedLossWrapper(BaseLoss):
             # accumulates ``.grad`` for ``GradAccumulator``.
             hidden_state_chunks_per_output = tuple(
                 tuple(
-                    chunk.detach().requires_grad_(requires_grad)
+                    chunk.detach().requires_grad_(needs_grad)
                     for chunk in _chunk_local(hidden_state)
                 )
-                for hidden_state in pred
+                for hidden_state, needs_grad in zip(pred, requires_grads, strict=True)
             )
             label_chunks_per_output = tuple(_chunk_local(label) for label in labels)
+            token_input_keys = {
+                key
+                for key, value in loss_inputs.items()
+                if isinstance(value, torch.Tensor) and value.ndim > 0
+            }
             input_chunks = {
-                key: _chunk_local(value) if isinstance(value, torch.Tensor) else value
+                key: _chunk_local(value) if key in token_input_keys else value
                 for key, value in loss_inputs.items()
             }
-            grad_accumulators = (
-                tuple(
-                    GradAccumulator(
-                        hidden_state,
-                        num_chunks=num_chunks,
-                        dtype=torch.float32,
-                    )
-                    for hidden_state in pred
+            grad_accumulators = tuple(
+                GradAccumulator(
+                    hidden_state,
+                    num_chunks=num_chunks,
+                    dtype=torch.float32,
                 )
-                if requires_grad
-                else ()
+                if needs_grad
+                else None
+                for hidden_state, needs_grad in zip(pred, requires_grads, strict=True)
             )
 
             total_loss = pred[0].new_zeros((), dtype=torch.float32)
@@ -669,11 +673,19 @@ class ChunkedLossWrapper(BaseLoss):
             metrics: dict[str, torch.Tensor] = {}
 
             fsdp_enabled = isinstance(lm_head, FSDPModule)
+            fsdp_sync_state = None
             # Disable FSDP reshard on lm_head to keep its weight unsharded across
             # all outputs and chunks, avoiding repeated all-gathers. Coalesce
-            # gradient synchronization into one reduce-scatter at the final chunk
-            # by disabling it for chunks 0..N-2.
+            # any enabled gradient synchronization into the final chunk.
             if fsdp_enabled:
+                # FSDP has no public getters for these flags. Save both because
+                # set_requires_gradient_sync also overwrites all_reduce_grads.
+                fsdp_param_group = lm_head._get_fsdp_state()._fsdp_param_group
+                if fsdp_param_group is not None:
+                    fsdp_sync_state = (
+                        fsdp_param_group.reduce_grads,
+                        fsdp_param_group.all_reduce_grads,
+                    )
                 lm_head.set_reshard_after_forward(False)
                 lm_head.set_reshard_after_backward(False)
                 lm_head.set_requires_gradient_sync(False, recurse=False)
@@ -687,9 +699,12 @@ class ChunkedLossWrapper(BaseLoss):
                     lm_head.unshard()
 
             for chunk_index in range(num_chunks):
-                if fsdp_enabled and chunk_index == num_chunks - 1:
+                if fsdp_sync_state is not None and chunk_index == num_chunks - 1:
                     lm_head.set_requires_gradient_sync(  # pyrefly: ignore[not-callable]
-                        True, recurse=False
+                        fsdp_sync_state[0], recurse=False
+                    )
+                    lm_head.set_requires_all_reduce(  # pyrefly: ignore[not-callable]
+                        fsdp_sync_state[1], recurse=False
                     )
 
                 h_chunks = tuple(
@@ -699,7 +714,7 @@ class ChunkedLossWrapper(BaseLoss):
                     chunks[chunk_index] for chunks in label_chunks_per_output
                 )
                 loss_inputs = {
-                    key: chunks[chunk_index] if isinstance(chunks, tuple) else chunks
+                    key: chunks[chunk_index] if key in token_input_keys else chunks
                     for key, chunks in input_chunks.items()
                 }
                 logits = tuple(lm_head(h_chunk) for h_chunk in h_chunks)
@@ -717,12 +732,18 @@ class ChunkedLossWrapper(BaseLoss):
 
                 if requires_grad:
                     with spmd.no_typecheck():
-                        chunk_loss.backward()
+                        if chunk_loss.requires_grad:
+                            chunk_loss.backward()
                         for h_chunk, grad_accumulator in zip(
                             h_chunks, grad_accumulators, strict=True
                         ):
-                            assert h_chunk.grad is not None
-                            grad_accumulator.add(h_chunk.grad)
+                            if grad_accumulator is None:
+                                continue
+                            grad_accumulator.add(
+                                h_chunk.grad
+                                if h_chunk.grad is not None
+                                else torch.zeros_like(h_chunk)
+                            )
                             h_chunk.grad = None
 
             if fsdp_enabled:
@@ -737,11 +758,12 @@ class ChunkedLossWrapper(BaseLoss):
                 for hidden_state, grad_accumulator in zip(
                     pred, grad_accumulators, strict=True
                 )
+                if grad_accumulator is not None
             )
 
         with spmd.no_typecheck():
             loss = self._gradient_backprop(
-                pred,
+                tuple(value for value in pred if value.requires_grad),
                 accumulated_grads,
                 total_loss,
             )
@@ -763,7 +785,7 @@ class ChunkedLossWrapper(BaseLoss):
             previous = current.get(key)
             if previous is None:
                 current[key] = value
-            elif key.endswith(("/mean", "/frac", "_mean", "_frac")):
+            elif key.endswith(("/mean", "/frac", "_mean", "_frac", "/sum")):
                 current[key] = previous + value
             elif key.endswith("/max"):
                 current[key] = torch.maximum(previous, value)
@@ -772,7 +794,7 @@ class ChunkedLossWrapper(BaseLoss):
             else:
                 raise ValueError(
                     f"Do not know how to reduce metric '{key}'. "
-                    "Use a /mean, /frac, _mean, _frac, /max, or /min suffix."
+                    "Use a /mean, /frac, _mean, _frac, /sum, /max, or /min suffix."
                 )
         return current
 

@@ -32,7 +32,7 @@ MODULE=flux CONFIG=flux_schnell ./run_train.sh
 - Parallelism: The model supports FSDP, HSDP, CP for training on multiple GPUs.
 - Activation checkpointing: The model uses activation checkpointing to reduce memory usage during training.
 - `torch.compile`: Per-block compilation for the Flux transformer (DoubleStreamBlock, SingleStreamBlock). See [torch.compile](#torchcompile) below.
-- MXFP8 quantization: Dynamic MXFP8 quantization for linear layers on SM100+ (sm100_family) hardware. See [MXFP8 Quantization](#mxfp8-quantization) below.
+- MXFP8 quantization: Dynamic MXFP8 quantization for linear layers on SM100+ (SM100 family) hardware. See [MXFP8 Quantization](#mxfp8-quantization) below.
 - Distributed checkpointing and loading.
     - Notes on the current checkpointing implementation: To keep the model weights are sharded the same way as checkpointing, we need to shard the model weights before saving the checkpoint. This is done by checking each module at the end of evaluation, and sharding the weights of the module if it is a FSDPModule.
 - CI for FLUX model. Supported periodically running integration tests on 8 GPUs, and unittests.

@@ -7,6 +7,7 @@
 # This file provides the util functions to apply activation checkpointing to the model.
 # Technically, this is not a part of distributed, but distributed module is the best place to put it.
 
+import inspect
 import logging
 import os
 from dataclasses import dataclass, field
@@ -15,22 +16,36 @@ from typing import Annotated, cast
 import torch
 import torch._functorch.config
 import torch.nn as nn
-import torch_remat as remat
 import tyro
 from torch._functorch.partitioners import get_default_op_list
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
 from torch.utils.checkpoint import (
+    checkpoint,
     CheckpointPolicy,
     create_selective_checkpoint_contexts,
+    set_checkpoint_early_stop,
 )
 
 from torchtitan.config import Configurable
+from torchtitan.distributed.utils import get_layer_containers
 from torchtitan.protocols.module import Module
 
 
 logger = logging.getLogger(__name__)
+
+
+def _checkpoint_with_early_stop(function, *args, early_stop=False, **kwargs):
+    # PyTorch 2.8 captures this context setting in the checkpoint frame.
+    with set_checkpoint_early_stop(early_stop):
+        return checkpoint(function, *args, use_reentrant=False, **kwargs)
+
+
+def _checkpoint_wrapper(module, **kwargs):
+    if "early_stop" not in inspect.signature(checkpoint).parameters:
+        kwargs["checkpoint_fn"] = _checkpoint_with_early_stop
+    return ptd_checkpoint_wrapper(module, **kwargs)
 
 
 def _get_default_save_ops() -> set:
@@ -111,8 +126,10 @@ def _disable_dynamo_lru_cache() -> None:
     # here is to disable the LRU cache, and select graphs in insertion order instead.
     #
     # Also see: https://github.com/pytorch/pytorch/issues/166926
-    # pyrefly: ignore [missing-attribute]
-    torch._C._dynamo.eval_frame._set_lru_cache(False)
+    # Older PyTorch versions predate this LRU cache and its control API.
+    set_lru_cache = getattr(torch._C._dynamo.eval_frame, "_set_lru_cache", None)
+    if set_lru_cache is not None:
+        set_lru_cache(False)
 
 
 class ActivationCheckpointing(Configurable):
@@ -155,15 +172,19 @@ class ActivationCheckpointing(Configurable):
         """Wrap a single transformer block with this policy's checkpointing."""
         raise NotImplementedError
 
-    def apply(self, model: nn.Module) -> None:
-        """Apply activation checkpointing to every transformer block of the model."""
+    def apply(
+        self, model: nn.Module, *, extra_layer_names: tuple[str, ...] = ()
+    ) -> None:
+        """Checkpoint the main blocks and any explicitly named extra containers."""
         _disable_dynamo_lru_cache()
-        layers = model.get_submodule("layers")
-        for layer_id, transformer_block in layers.named_children():
-            transformer_block = self._wrap_block(
-                transformer_block, base_fqn=f"layers.{layer_id}"
-            )
-            layers.register_module(layer_id, transformer_block)
+        for name, layers in get_layer_containers(
+            model, extra_layer_names=extra_layer_names
+        ):
+            for layer_id, transformer_block in layers.named_children():
+                transformer_block = self._wrap_block(
+                    transformer_block, base_fqn=f"{name}.{layer_id}"
+                )
+                layers.register_module(layer_id, transformer_block)
         logger.info(
             f"Applied {type(self).__name__} activation checkpointing to the model"
         )
@@ -179,7 +200,7 @@ class FullAC(ActivationCheckpointing):
     def _wrap_block(
         self, module: nn.Module, *, base_fqn: str | None = None
     ) -> nn.Module:
-        return ptd_checkpoint_wrapper(
+        return _checkpoint_wrapper(
             module,
             preserve_rng_state=self.config.preserve_rng_state,
             determinism_check=self.config.determinism_check,
@@ -285,7 +306,7 @@ class SelectiveAC(ActivationCheckpointing):
 
             return wrapped_policy
 
-        return ptd_checkpoint_wrapper(
+        return _checkpoint_wrapper(
             module,
             context_fn=lambda: create_selective_checkpoint_contexts(
                 _get_custom_policy()
@@ -344,6 +365,8 @@ class RegionAC(ActivationCheckpointing):
     ) -> nn.Module:
         config = cast("RegionAC.Config", self.config)
         checkpoint_region_name = base_fqn or type(module).__name__
+        import torch_remat as remat
+
         checkpointed_forward = remat.checkpoint(
             region_name=checkpoint_region_name,
             determinism_check=config.determinism_check,
@@ -352,20 +375,27 @@ class RegionAC(ActivationCheckpointing):
         module.forward = checkpointed_forward
         return module
 
-    def apply(self, model: nn.Module) -> None:
+    def apply(
+        self, model: nn.Module, *, extra_layer_names: tuple[str, ...] = ()
+    ) -> None:
         config = cast("RegionAC.Config", self.config)
-        layers = model.get_submodule("layers")
-        transformer_blocks = list(layers.named_children())
+        transformer_blocks = [
+            (f"{name}.{layer_id}", block)
+            for name, layers in get_layer_containers(
+                model, extra_layer_names=extra_layer_names
+            )
+            for layer_id, block in layers.named_children()
+        ]
         if not transformer_blocks:
             logger.info("RegionAC found no transformer blocks in this model part")
             return
 
         # TODO: Validate unmatched patterns once validation can account for save
         # regions across all pipeline stages instead of only this model part.
-        for layer_id, transformer_block in transformer_blocks:
+        for base_fqn, transformer_block in transformer_blocks:
             assert isinstance(transformer_block, Module)
             transformer_block.configure_remat_regions(config.save_regions)
-            self._wrap_block(transformer_block, base_fqn=f"layers.{layer_id}")
+            self._wrap_block(transformer_block, base_fqn=base_fqn)
         logger.info(
             "Applied RegionAC to %d transformer blocks. Save patterns: %s",
             len(transformer_blocks),
@@ -402,8 +432,12 @@ class MemoryBudgetAC(ActivationCheckpointing):
             if not 0 <= self.memory_budget <= 1:
                 raise ValueError("memory_budget must be finite and between 0 and 1.")
 
-    def apply(self, model: nn.Module) -> None:
+    def apply(
+        self, model: nn.Module, *, extra_layer_names: tuple[str, ...] = ()
+    ) -> None:
         _disable_dynamo_lru_cache()
+        if extra_layer_names:
+            get_layer_containers(model, extra_layer_names=extra_layer_names)
         config = cast("MemoryBudgetAC.Config", self.config)
         if config.visualize_memory_budget_pareto:
             pareto_dir = os.path.join(self.dump_folder, "memory_budget_pareto")

@@ -188,6 +188,14 @@ class ParallelDims:
                 if not self._mesh_exist(name, degree):
                     backend_override[name] = "fake"
 
+            if not hasattr(world_mesh, "_unflatten"):
+                # PyTorch 2.8 has no reshape API. Construct equivalent rank
+                # grids with real singleton groups instead of fake backends.
+                return DeviceMesh(
+                    world_mesh.device_type,
+                    world_mesh.mesh.reshape(dim_degrees),
+                    mesh_dim_names=dim_names,
+                )
             return world_mesh._unflatten(
                 0,
                 dim_degrees,
@@ -251,7 +259,7 @@ class ParallelDims:
             "ep": full_sparse_mesh["ep"],
             "efsdp": full_sparse_mesh["efsdp"],
         }
-        self._single_axis_meshes["dp"] = spmd_dense_mesh_for_fwdbwd["dp"]
+        self._single_axis_meshes["dp"] = full_dense_mesh_for_fwdbwd["dp"]
         self._single_axis_meshes["dp_shard"] = full_dense_mesh_for_fsdp["dp_shard"]
 
         self._validate_meshes()
@@ -390,7 +398,8 @@ class ParallelDims:
 
     def get_dense_tp_mesh(self) -> DeviceMesh:
         """Return the TP-axis mesh used by dense forward/backward computation."""
-        return self.spmd_dense_mesh()["tp"]
+        self.spmd_dense_mesh()
+        return self._single_axis_meshes["tp"]
 
     def get_activated_mesh(self, axes: list[str]) -> DeviceMesh | None:
         """Submesh of ``axes`` filtered to those actually enabled in this run.
